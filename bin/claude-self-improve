@@ -1,0 +1,524 @@
+#!/bin/bash
+# Claude Self-Improvement System
+# Analyzes Claude Code session performance data and updates persistent memory
+# Usage: claude-self-improve [--interactive] [--bootstrap] [--dry-run] [--memory-dir DIR]
+
+set +e
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+DATA_DIR="${CLAUDE_IMPROVE_DATA_DIR:-$HOME/.local/share/claude-improve}"
+PROMPTS_DIR="$DATA_DIR/prompts"
+BACKUPS_DIR="$DATA_DIR/backups"
+FACETS_DIR="$HOME/.claude/usage-data/facets"
+
+# Auto-detect memory directory: check env var, then find active project memory
+if [ -n "$CLAUDE_MEMORY_DIR" ]; then
+    MEMORY_DIR="$CLAUDE_MEMORY_DIR"
+else
+    # Find the most recently modified MEMORY.md under Claude's project memory dirs
+    MEMORY_DIR=$(find "$HOME/.claude/projects" -name "MEMORY.md" -maxdepth 3 2>/dev/null \
+        | xargs ls -t 2>/dev/null \
+        | head -1 \
+        | xargs dirname 2>/dev/null)
+
+    if [ -z "$MEMORY_DIR" ]; then
+        echo "ERROR: Could not auto-detect memory directory."
+        echo "Set CLAUDE_MEMORY_DIR or pass --memory-dir <path>"
+        exit 1
+    fi
+fi
+
+MEMORY_FILE="$MEMORY_DIR/MEMORY.md"
+LAST_RUN="$DATA_DIR/last-run.json"
+METRICS_FILE="$DATA_DIR/metrics.jsonl"
+SUGGESTIONS_FILE="$DATA_DIR/claude-md-suggestions.md"
+LOG_FILE="$DATA_DIR/run.log"
+MAX_BACKUPS=10
+
+# Cost caps
+ANALYZE_BUDGET="0.50"
+UPDATE_BUDGET="0.30"
+
+# ─── Parse Arguments ─────────────────────────────────────────────────────────
+INTERACTIVE=false
+BOOTSTRAP=false
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --interactive) INTERACTIVE=true; shift ;;
+        --bootstrap)   BOOTSTRAP=true; shift ;;
+        --dry-run)     DRY_RUN=true; shift ;;
+        --memory-dir)
+            MEMORY_DIR="$2"
+            MEMORY_FILE="$MEMORY_DIR/MEMORY.md"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: claude-self-improve [OPTIONS]"
+            echo ""
+            echo "Analyzes Claude Code session data and updates persistent memory."
+            echo ""
+            echo "Options:"
+            echo "  --interactive      Show proposed changes and ask for confirmation"
+            echo "  --bootstrap        Process ALL existing facets (first run or reprocess)"
+            echo "  --dry-run          Run analysis but don't update any files"
+            echo "  --memory-dir DIR   Path to Claude Code memory directory"
+            echo "                     (auto-detected if not set)"
+            echo ""
+            echo "Environment Variables:"
+            echo "  CLAUDE_MEMORY_DIR       Override memory directory path"
+            echo "  CLAUDE_IMPROVE_DATA_DIR Override data directory (default: ~/.local/share/claude-improve)"
+            echo ""
+            echo "Stages:"
+            echo "  1. Collect  — Gathers session facets from ~/.claude/usage-data/facets/"
+            echo "  2. Analyze  — Sends to headless Claude (Sonnet) for pattern extraction"
+            echo "  3. Update   — Applies memory updates via headless Claude (Sonnet)"
+            echo ""
+            exit 0
+            ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg"
+    echo "$msg" >> "$LOG_FILE"
+}
+
+# ─── Preflight Checks ───────────────────────────────────────────────────────
+if [ ! -d "$FACETS_DIR" ]; then
+    log "ERROR: Facets directory not found at $FACETS_DIR"
+    log "  Claude Code must be installed and have usage data."
+    exit 1
+fi
+
+if [ ! -f "$MEMORY_FILE" ]; then
+    log "ERROR: MEMORY.md not found at $MEMORY_FILE"
+    log "  Create one or set CLAUDE_MEMORY_DIR to the correct path."
+    exit 1
+fi
+
+if ! command -v claude &>/dev/null; then
+    log "ERROR: claude CLI not found in PATH"
+    log "  Install Claude Code: https://docs.anthropic.com/en/docs/claude-code"
+    exit 1
+fi
+
+if ! command -v python3 &>/dev/null; then
+    log "ERROR: python3 not found in PATH"
+    exit 1
+fi
+
+if ! command -v jq &>/dev/null; then
+    log "ERROR: jq not found in PATH"
+    log "  Install: brew install jq (macOS) or apt install jq (Linux)"
+    exit 1
+fi
+
+mkdir -p "$DATA_DIR" "$PROMPTS_DIR" "$BACKUPS_DIR"
+
+# Ensure prompts exist (copy from repo if installed via install.sh)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_PROMPTS="$SCRIPT_DIR/../prompts"
+if [ -d "$REPO_PROMPTS" ]; then
+    for f in "$REPO_PROMPTS"/*.md; do
+        [ -f "$f" ] && cp -n "$f" "$PROMPTS_DIR/" 2>/dev/null
+    done
+fi
+
+log "═══════════════════════════════════════════════════"
+log "  CLAUDE SELF-IMPROVEMENT RUN"
+log "  Mode: $([ "$BOOTSTRAP" = true ] && echo "BOOTSTRAP" || echo "incremental")"
+log "  Interactive: $INTERACTIVE | Dry-run: $DRY_RUN"
+log "  Memory: $MEMORY_FILE"
+log "═══════════════════════════════════════════════════"
+
+# ─── Stage 1: Collect ────────────────────────────────────────────────────────
+log "Stage 1: Collecting session data..."
+
+# Count total facets
+TOTAL_FACETS=$(ls "$FACETS_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+log "  Total facets on disk: $TOTAL_FACETS"
+
+# Determine which facets to process
+LAST_COUNT=0
+if [ -f "$LAST_RUN" ] && [ "$BOOTSTRAP" = false ]; then
+    LAST_COUNT=$(jq -r '.facets_processed // 0' "$LAST_RUN" 2>/dev/null || echo "0")
+fi
+
+if [ "$BOOTSTRAP" = true ]; then
+    PROCESS_COUNT=$TOTAL_FACETS
+    log "  Bootstrap mode: processing ALL $TOTAL_FACETS facets"
+else
+    PROCESS_COUNT=$((TOTAL_FACETS - LAST_COUNT))
+    log "  Previously processed: $LAST_COUNT"
+    log "  New facets to process: $PROCESS_COUNT"
+fi
+
+# Check if there's new data
+if [ "$PROCESS_COUNT" -le 0 ] && [ "$BOOTSTRAP" = false ]; then
+    log "No new sessions to analyze. Run with --bootstrap to reprocess all."
+    # macOS notification (silently skip on Linux)
+    osascript -e 'display notification "No new sessions to analyze" with title "Claude Self-Improve"' 2>/dev/null
+    exit 0
+fi
+
+# Read current MEMORY.md line count
+MEMORY_LINES=$(wc -l < "$MEMORY_FILE" | tr -d ' ')
+
+# Assemble payload using Python (avoids shell quoting issues with JSON)
+PAYLOAD_FILE="$DATA_DIR/payload.json"
+FACETS_TMP="$DATA_DIR/facets-tmp.json"
+METRICS_TMP="$DATA_DIR/metrics-tmp.json"
+
+# Write facets to temp file
+if [ "$BOOTSTRAP" = true ]; then
+    SLICE_COUNT=0  # 0 means all
+else
+    SLICE_COUNT=$PROCESS_COUNT
+fi
+
+python3 -c "
+import json, glob, os, sys
+
+facets_dir = '$FACETS_DIR'
+files = sorted(glob.glob(os.path.join(facets_dir, '*.json')), key=os.path.getmtime)
+slice_count = $SLICE_COUNT
+if slice_count > 0:
+    files = files[-slice_count:]
+
+facets = []
+for f in files:
+    with open(f) as fh:
+        facets.append(json.load(fh))
+
+with open('$FACETS_TMP', 'w') as out:
+    json.dump(facets, out)
+
+print(f'Collected {len(facets)} facets')
+" 2>&1 | while read -r line; do log "  $line"; done
+
+# Write previous metrics to temp file
+if [ -f "$METRICS_FILE" ]; then
+    tail -12 "$METRICS_FILE" | python3 -c "
+import sys, json
+lines = [l.strip() for l in sys.stdin if l.strip()]
+metrics = []
+for l in lines:
+    try:
+        metrics.append(json.loads(l))
+    except:
+        pass
+with open('$METRICS_TMP', 'w') as out:
+    json.dump(metrics, out)
+" 2>/dev/null
+fi
+[ -f "$METRICS_TMP" ] || echo "[]" > "$METRICS_TMP"
+
+# Assemble final payload from temp files (safe from shell quoting)
+python3 -c "
+import json
+
+with open('$FACETS_TMP') as f:
+    facets = json.load(f)
+with open('$METRICS_TMP') as f:
+    prev_metrics = json.load(f)
+with open('$MEMORY_FILE') as f:
+    memory_content = f.read()
+
+payload = {
+    'facets': facets,
+    'current_memory': memory_content,
+    'memory_line_count': $MEMORY_LINES,
+    'previous_metrics': prev_metrics,
+    'is_bootstrap': $([ "$BOOTSTRAP" = true ] && echo "True" || echo "False")
+}
+
+with open('$PAYLOAD_FILE', 'w') as out:
+    json.dump(payload, out, indent=2)
+
+print(f'Payload assembled: {len(facets)} facets, {$MEMORY_LINES} memory lines')
+" 2>&1 | while read -r line; do log "  $line"; done
+
+# Clean up temp files
+rm -f "$FACETS_TMP" "$METRICS_TMP"
+
+if [ ! -f "$PAYLOAD_FILE" ]; then
+    log "ERROR: Failed to assemble payload"
+    exit 1
+fi
+
+log "Stage 1 complete."
+
+# ─── Stage 2: Analyze ────────────────────────────────────────────────────────
+log ""
+log "Stage 2: Analyzing session data with headless Claude..."
+
+ANALYSIS_FILE="$DATA_DIR/analysis.json"
+ANALYZE_PROMPT_FILE="$PROMPTS_DIR/analyze.md"
+
+if [ ! -f "$ANALYZE_PROMPT_FILE" ]; then
+    log "ERROR: Analysis prompt not found at $ANALYZE_PROMPT_FILE"
+    log "  Run install.sh or copy prompts/ to $PROMPTS_DIR/"
+    exit 1
+fi
+
+# Build a prompt file that includes instructions + payload
+PROMPT_FILE="$DATA_DIR/analyze-prompt.txt"
+{
+    echo "Analyze this session performance data and return JSON only (no markdown fences)."
+    echo ""
+    echo "=== PAYLOAD ==="
+    cat "$PAYLOAD_FILE"
+} > "$PROMPT_FILE"
+
+# Pipe prompt via stdin to avoid shell argument length limits
+cat "$PROMPT_FILE" | claude -p - \
+    --append-system-prompt "$(cat "$ANALYZE_PROMPT_FILE")" \
+    --allowedTools "Read" "Glob" "Grep" \
+    --output-format json \
+    --model sonnet \
+    --max-budget-usd "$ANALYZE_BUDGET" \
+    > "$ANALYSIS_FILE" 2>"$DATA_DIR/analyze-stderr.log"
+
+ANALYZE_EXIT=$?
+
+if [ $ANALYZE_EXIT -ne 0 ]; then
+    log "ERROR: Analysis stage failed (exit code $ANALYZE_EXIT)"
+    log "  Check $DATA_DIR/analyze-stderr.log for details"
+    exit 1
+fi
+
+# Extract the result text from the JSON output
+# claude --output-format json wraps in {"type":"result","subtype":"success","result":"..."}
+ANALYSIS_RESULT=$(jq -r '.result // .' "$ANALYSIS_FILE" 2>/dev/null)
+
+# Parse analysis result — strip markdown fences, extract JSON
+PARSE_SCRIPT="$DATA_DIR/parse-analysis.py"
+cat > "$PARSE_SCRIPT" << 'PYEOF'
+import sys, json, re
+
+text = sys.stdin.read().strip()
+
+# Strip markdown code fences if present
+text = re.sub(r'^```json\s*', '', text)
+text = re.sub(r'\s*```$', '', text)
+
+# Try to parse directly
+try:
+    data = json.loads(text)
+    print(json.dumps(data, indent=2))
+    sys.exit(0)
+except json.JSONDecodeError:
+    pass
+
+# Try to find JSON object in the text
+match = re.search(r'\{[\s\S]*\}', text)
+if match:
+    try:
+        data = json.loads(match.group())
+        print(json.dumps(data, indent=2))
+        sys.exit(0)
+    except json.JSONDecodeError:
+        pass
+
+# Fallback: output raw text
+print(text)
+sys.exit(1)
+PYEOF
+
+CLEAN_ANALYSIS=$(echo "$ANALYSIS_RESULT" | python3 "$PARSE_SCRIPT" 2>/dev/null)
+
+if [ $? -ne 0 ]; then
+    log "WARNING: Could not parse analysis as JSON. Raw output saved to $ANALYSIS_FILE"
+    log "  Attempting to continue with raw output..."
+    CLEAN_ANALYSIS="$ANALYSIS_RESULT"
+fi
+
+echo "$CLEAN_ANALYSIS" > "$ANALYSIS_FILE"
+
+# Display summary
+SESSIONS=$(echo "$CLEAN_ANALYSIS" | jq -r '.sessions_analyzed // "?"' 2>/dev/null)
+FRICTION_RATE=$(echo "$CLEAN_ANALYSIS" | jq -r '.friction_summary.friction_rate // "?"' 2>/dev/null)
+TREND=$(echo "$CLEAN_ANALYSIS" | jq -r '.trend // "unknown"' 2>/dev/null)
+UPDATE_COUNT=$(echo "$CLEAN_ANALYSIS" | jq -r '.memory_updates | length // 0' 2>/dev/null)
+SUGGESTION_COUNT=$(echo "$CLEAN_ANALYSIS" | jq -r '.claude_md_suggestions | length // 0' 2>/dev/null)
+
+log ""
+log "  Analysis Results:"
+log "  ─────────────────────────────"
+log "  Sessions analyzed:  $SESSIONS"
+log "  Friction rate:      $FRICTION_RATE"
+log "  Trend:              $TREND"
+log "  Memory updates:     $UPDATE_COUNT proposed"
+log "  CLAUDE.md suggests: $SUGGESTION_COUNT"
+log ""
+
+# Show details of each proposed memory update
+if [ "$UPDATE_COUNT" -gt 0 ] 2>/dev/null; then
+    log "  Proposed Memory Updates:"
+    log "  ─────────────────────────────"
+    echo "$CLEAN_ANALYSIS" | jq -r '.memory_updates[]? | "  [\(.operation)] → \(.section // .filename)\n    \(.content | split("\n")[0])\n    Reason: \(.reason)\n"' 2>/dev/null | while IFS= read -r line; do
+        log "$line"
+    done
+fi
+
+# Save CLAUDE.md suggestions (never auto-applied)
+if [ "$SUGGESTION_COUNT" -gt 0 ] 2>/dev/null; then
+    echo "# CLAUDE.md Suggestions ($(date '+%Y-%m-%d'))" > "$SUGGESTIONS_FILE"
+    echo "" >> "$SUGGESTIONS_FILE"
+    echo "These suggestions are based on friction patterns seen in 3+ sessions." >> "$SUGGESTIONS_FILE"
+    echo "Review and apply manually if appropriate." >> "$SUGGESTIONS_FILE"
+    echo "" >> "$SUGGESTIONS_FILE"
+    echo "$CLEAN_ANALYSIS" | jq -r '.claude_md_suggestions[]? | "## \(.suggestion)\n- Evidence: \(.evidence)\n- Sessions seen: \(.sessions_seen)\n"' >> "$SUGGESTIONS_FILE" 2>/dev/null
+    log "  CLAUDE.md suggestions saved to: $SUGGESTIONS_FILE"
+fi
+
+# Save metrics to time-series file
+METRICS_ENTRY=$(echo "$CLEAN_ANALYSIS" | jq -c '.metrics // {}' 2>/dev/null)
+if [ "$METRICS_ENTRY" != "{}" ] && [ -n "$METRICS_ENTRY" ]; then
+    echo "$METRICS_ENTRY" >> "$METRICS_FILE"
+    log "  Metrics appended to: $METRICS_FILE"
+fi
+
+log "Stage 2 complete."
+
+# ─── Interactive Confirmation ────────────────────────────────────────────────
+if [ "$INTERACTIVE" = true ] && [ "$UPDATE_COUNT" -gt 0 ] 2>/dev/null; then
+    echo ""
+    echo "═══════════════════════════════════════════════════"
+    echo "  PROPOSED MEMORY UPDATES"
+    echo "═══════════════════════════════════════════════════"
+    echo ""
+    echo "$CLEAN_ANALYSIS" | jq -r '.memory_updates[]? | "  [\(.operation)] \(.section // .filename):\n    \(.content | split("\n")[0])\n    Reason: \(.reason)\n"' 2>/dev/null
+    echo ""
+    read -p "Apply these updates? (y/n) " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log "Updates cancelled by user."
+        exit 0
+    fi
+fi
+
+# ─── Dry-run Exit ────────────────────────────────────────────────────────────
+if [ "$DRY_RUN" = true ]; then
+    log "Dry-run mode: skipping Stage 3 (memory update)."
+    log "Analysis saved to: $ANALYSIS_FILE"
+    exit 0
+fi
+
+# ─── Stage 3: Update Memory ─────────────────────────────────────────────────
+if [ "$UPDATE_COUNT" -le 0 ] 2>/dev/null; then
+    log "No memory updates to apply. Skipping Stage 3."
+else
+    log ""
+    log "Stage 3: Updating memory files..."
+
+    # Backup current MEMORY.md
+    BACKUP_FILE="$BACKUPS_DIR/MEMORY_$(date '+%Y%m%d_%H%M%S').md"
+    cp "$MEMORY_FILE" "$BACKUP_FILE"
+    log "  Backup saved to: $BACKUP_FILE"
+
+    # Prune old backups (keep latest MAX_BACKUPS)
+    BACKUP_COUNT=$(ls "$BACKUPS_DIR"/MEMORY_*.md 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$BACKUP_COUNT" -gt "$MAX_BACKUPS" ]; then
+        ls -t "$BACKUPS_DIR"/MEMORY_*.md | tail -n +$((MAX_BACKUPS + 1)) | xargs rm -f
+        log "  Pruned old backups (kept latest $MAX_BACKUPS)"
+    fi
+
+    # Also backup any topic files that will be modified
+    for f in "$MEMORY_DIR"/*.md; do
+        if [ -f "$f" ] && [ "$(basename "$f")" != "MEMORY.md" ]; then
+            cp "$f" "$BACKUPS_DIR/$(basename "$f" .md)_$(date '+%Y%m%d_%H%M%S').md"
+        fi
+    done
+
+    # Build update prompt file
+    UPDATE_PROMPT_FILE="$PROMPTS_DIR/update-memory.md"
+
+    if [ ! -f "$UPDATE_PROMPT_FILE" ]; then
+        log "ERROR: Update prompt not found at $UPDATE_PROMPT_FILE"
+        exit 1
+    fi
+
+    UPDATE_INPUT_FILE="$DATA_DIR/update-input.txt"
+    {
+        echo "Apply these memory updates to the files in $MEMORY_DIR/:"
+        echo ""
+        jq '{memory_updates, metrics}' "$ANALYSIS_FILE" 2>/dev/null
+    } > "$UPDATE_INPUT_FILE"
+
+    cat "$UPDATE_INPUT_FILE" | claude -p - \
+        --append-system-prompt "$(cat "$UPDATE_PROMPT_FILE")" \
+        --allowedTools "Read" "Edit" "Write" \
+        --model sonnet \
+        --max-budget-usd "$UPDATE_BUDGET" \
+        > "$DATA_DIR/update-output.json" 2>"$DATA_DIR/update-stderr.log"
+
+    UPDATE_EXIT=$?
+
+    if [ $UPDATE_EXIT -ne 0 ]; then
+        log "WARNING: Update stage had issues (exit code $UPDATE_EXIT)"
+        log "  Check $DATA_DIR/update-stderr.log for details"
+        log "  MEMORY.md backup available at: $BACKUP_FILE"
+    else
+        # Verify MEMORY.md line count
+        NEW_LINES=$(wc -l < "$MEMORY_FILE" | tr -d ' ')
+        log "  MEMORY.md updated: $MEMORY_LINES → $NEW_LINES lines"
+
+        if [ "$NEW_LINES" -gt 180 ]; then
+            log "  WARNING: MEMORY.md exceeds 180 line budget ($NEW_LINES lines)"
+            log "  Consider running again or manually moving content to topic files"
+        fi
+
+        # Show actual diff of what changed
+        DIFF_OUTPUT=$(diff "$BACKUP_FILE" "$MEMORY_FILE" 2>/dev/null)
+        if [ -n "$DIFF_OUTPUT" ]; then
+            log ""
+            log "  Changes Applied to MEMORY.md:"
+            log "  ─────────────────────────────"
+            echo "$DIFF_OUTPUT" | while IFS= read -r line; do
+                log "  $line"
+            done
+        fi
+
+        # Show any new topic files created
+        for f in "$MEMORY_DIR"/*.md; do
+            fname=$(basename "$f")
+            if [ "$fname" != "MEMORY.md" ] && [ ! -f "$BACKUPS_DIR/${fname%.md}_"*.md ] 2>/dev/null; then
+                log ""
+                log "  New topic file created: $fname"
+            fi
+        done
+    fi
+
+    log ""
+    log "Stage 3 complete."
+fi
+
+# ─── Update State ────────────────────────────────────────────────────────────
+cat > "$LAST_RUN" << EOF
+{
+    "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+    "facets_processed": $TOTAL_FACETS,
+    "sessions_analyzed": $SESSIONS,
+    "friction_rate": "$FRICTION_RATE",
+    "trend": "$TREND",
+    "updates_applied": $UPDATE_COUNT
+}
+EOF
+
+log ""
+log "═══════════════════════════════════════════════════"
+log "  SELF-IMPROVEMENT RUN COMPLETE"
+log "  Sessions: $SESSIONS | Friction: $FRICTION_RATE | Trend: $TREND"
+log "  Memory updates: $UPDATE_COUNT applied"
+log "═══════════════════════════════════════════════════"
+
+# macOS notification (silently skip on Linux)
+osascript -e "display notification \"Sessions: $SESSIONS | Friction: $FRICTION_RATE | Trend: $TREND\" with title \"Claude Self-Improve\" subtitle \"$UPDATE_COUNT memory updates applied\"" 2>/dev/null
+
+exit 0
