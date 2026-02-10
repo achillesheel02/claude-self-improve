@@ -2,6 +2,8 @@
 
 A self-improvement system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Analyzes your session performance data to automatically extract patterns, identify friction points, and update Claude's persistent memory — so it gets better at helping you over time.
 
+![demo](demo.gif)
+
 ## How It Works
 
 Claude Code stores session performance data as "facets" — JSON files capturing outcomes, friction events, and satisfaction signals. This system:
@@ -72,7 +74,7 @@ Claude Code stores session performance data as "facets" — JSON files capturing
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-self-improve.git
+git clone https://github.com/achillesheel02/claude-self-improve.git
 cd claude-self-improve
 ./install.sh
 ```
@@ -199,6 +201,53 @@ The analysis and update prompts are in `~/.local/share/claude-improve/prompts/`:
 - `update-memory.md` — Controls how MEMORY.md is updated
 
 Edit these to change what the system tracks or how it writes memories.
+
+## Example Output
+
+Here's what a bootstrap run looks like (analyzing 52 Claude Code sessions):
+
+```
+═══════════════════════════════════════════════════
+  CLAUDE SELF-IMPROVEMENT RUN
+  Mode: BOOTSTRAP
+  Interactive: false | Dry-run: false
+═══════════════════════════════════════════════════
+Stage 1: Collecting session data...
+  Total facets on disk: 52
+  Bootstrap mode: processing ALL 52 facets
+  Collected 52 facets
+  Payload assembled: 52 facets, 109 memory lines
+Stage 1 complete.
+
+Stage 2: Analyzing session data with headless Claude...
+
+  Analysis Results:
+  ─────────────────────────────
+  Sessions analyzed:  52
+  Friction rate:      0.42
+  Trend:              stable
+  Memory updates:     4 proposed
+  CLAUDE.md suggests: 3
+
+Stage 2 complete.
+
+Stage 3: Updating memory files...
+  Backup saved to: ~/.local/share/claude-improve/backups/MEMORY_20260210_231500.md
+  MEMORY.md updated: 109 → 115 lines
+Stage 3 complete.
+
+═══════════════════════════════════════════════════
+  SELF-IMPROVEMENT RUN COMPLETE
+  Sessions: 52 | Friction: 0.42 | Trend: stable
+  Memory updates: 4 applied
+═══════════════════════════════════════════════════
+```
+
+In this run, the system:
+- Analyzed 52 sessions and found a 42% friction rate
+- Proposed 4 memory updates (new anti-patterns, lessons, and preferences)
+- Suggested 3 additions to the project's CLAUDE.md
+- Backed up existing memory before applying changes
 
 ## License
 
