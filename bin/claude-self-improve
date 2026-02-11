@@ -189,7 +189,7 @@ for f in sorted(glob.glob(os.path.join(facets_dir, '*.json')), key=os.path.getmt
         pass
 
 # 2. Read history.jsonl -> {sessionId: {project, messages, timestamp}}
-history_data = defaultdict(lambda: {'project': '', 'messages': [], 'timestamp': '', 'msg_count': 0})
+history_data = defaultdict(lambda: {'project': '', 'messages': [], 'timestamp': ''})
 if os.path.exists(history_file):
     with open(history_file) as hf:
         for line in hf:
@@ -205,12 +205,10 @@ if os.path.exists(history_file):
                 ts = entry.get('timestamp', '')
                 if ts:
                     h['timestamp'] = ts
-                # Collect first 3 user messages
+                # Collect all user messages (prioritized later)
                 display = entry.get('display', '')
-                if display and h['msg_count'] < 3:
-                    # Truncate long messages
-                    h['messages'].append(display[:200])
-                    h['msg_count'] += 1
+                if display:
+                    h['messages'].append(display)
             except:
                 pass
 
@@ -225,8 +223,19 @@ for sid in all_sids:
     summary = facet.get('summary', '')
     goal = facet.get('goal', '')
     project = hist.get('project', '') if hist else ''
-    messages = hist.get('messages', []) if hist else []
     timestamp = hist.get('timestamp', '') if hist else ''
+
+    # Priority sampling: longer messages = more informative, cap at 800 chars total
+    raw_msgs = hist.get('messages', []) if hist else []
+    sorted_msgs = sorted(raw_msgs, key=len, reverse=True)
+    messages = []
+    total_chars = 0
+    for msg in sorted_msgs:
+        snippet = msg[:120]
+        if total_chars + len(snippet) > 800:
+            break
+        messages.append(snippet)
+        total_chars += len(snippet)
 
     # Skip sessions with no useful metadata
     if not summary and not goal and not messages:
