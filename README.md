@@ -8,6 +8,7 @@ A self-improvement system for [Claude Code](https://docs.anthropic.com/en/docs/c
 
 Claude Code stores session performance data as "facets" — JSON files capturing outcomes, friction events, and satisfaction signals. This system:
 
+0. **Generates** missing facets from session transcripts (via Haiku — auto-detects stale data)
 1. **Collects** new session facets since the last run
 2. **Analyzes** them with headless Claude (Sonnet) to extract patterns
 3. **Updates** your MEMORY.md with new lessons, anti-patterns, and preferences
@@ -16,6 +17,16 @@ Claude Code stores session performance data as "facets" — JSON files capturing
 ┌─────────────────────────┐
 │   Claude Code Sessions  │
 │   (your daily usage)    │
+└───────────┬─────────────┘
+            │ session transcripts
+            ▼
+┌─────────────────────────┐
+│  Stage 0: Refresh       │
+│  Auto-generate facets   │
+│  for sessions missing   │
+│  them (Haiku, ~$0.01/   │
+│  session). Skips if     │
+│  /insights ran recently │
 └───────────┬─────────────┘
             │ facets (JSON)
             ▼
@@ -124,6 +135,20 @@ Analyze without modifying any files:
 claude-self-improve --dry-run
 ```
 
+### Skip Facet Generation
+
+Use only existing facets (skip Stage 0):
+
+```bash
+claude-self-improve --no-refresh
+```
+
+Force facet generation even if facets are fresh:
+
+```bash
+claude-self-improve --refresh-facets
+```
+
 ### Slash Command
 
 Inside Claude Code:
@@ -198,17 +223,26 @@ After each run, the system produces:
 
 The system uses headless Claude (Sonnet) for analysis. Typical costs:
 
-| Stage | Budget Cap | Typical Cost |
-|-------|-----------|--------------|
-| Analyze | $0.50 | $0.05–0.15 |
-| Update | $0.30 | $0.02–0.05 |
-| **Total per run** | **$0.80** | **$0.07–0.20** |
+| Stage | Model | Budget Cap | Typical Cost |
+|-------|-------|-----------|--------------|
+| Refresh (per session) | Haiku | $0.05 | ~$0.01 |
+| Refresh (50 sessions) | Haiku | $2.50 | ~$0.50 |
+| Analyze | Sonnet | $0.50 | $0.05–0.15 |
+| Update | Sonnet | $0.30 | $0.02–0.05 |
+| **Total per run** | | **$3.30** | **$0.15–0.70** |
 
-Running weekly costs roughly **$0.50–1.00/month**.
+Running weekly costs roughly **$1–3/month**. Stage 0 only runs when facets are stale (>1h old) and only generates facets for sessions that don't have them, so most incremental runs process 0–5 sessions.
 
 ## How Facets Work
 
-Claude Code generates session facets automatically when you end a conversation. Each facet includes:
+Session facets are JSON summaries of each Claude Code conversation. They can come from two sources:
+
+1. **`/insights`** — Claude Code's built-in command generates facets in batch when you run it
+2. **Stage 0 (auto-generate)** — Self-improve generates missing facets from session transcripts via Haiku
+
+Stage 0 checks for staleness: if facets were recently generated (by `/insights` or a previous run), it skips generation. Self-generated facets are tagged with `"source": "self-improve"` to distinguish them.
+
+Each facet includes:
 
 - `friction_counts` — Types and counts of friction events
 - `friction_detail` — Free-text description of what went wrong
@@ -223,8 +257,9 @@ The self-improvement system reads these facets to find patterns across sessions.
 
 The analysis and update prompts are in `~/.local/share/claude-improve/prompts/`:
 
-- `analyze.md` — Controls what patterns to look for and output format
-- `update-memory.md` — Controls how MEMORY.md is updated
+- `generate-facet.md` — Controls how session transcripts are summarized into facets (Stage 0)
+- `analyze.md` — Controls what patterns to look for and output format (Stage 2)
+- `update-memory.md` — Controls how MEMORY.md is updated (Stage 3)
 
 Edit these to change what the system tracks or how it writes memories.
 
@@ -238,11 +273,20 @@ Here's what a bootstrap run looks like (analyzing 52 Claude Code sessions):
   Mode: BOOTSTRAP
   Interactive: false | Dry-run: false
 ═══════════════════════════════════════════════════
+Stage 0: Checking for sessions without facets...
+  Facets are 25h stale.
+  Tip: Run /insights in Claude Code for faster facet generation.
+  Found 8 sessions without facets. Generating via Haiku...
+  [1/8] Generating facet for e82ff44f-5add...
+  [2/8] Generating facet for a0113c39-9627...
+  ...
+  Generated 8 new facets.
+Stage 0 complete.
 Stage 1: Collecting session data...
-  Total facets on disk: 52
-  Bootstrap mode: processing ALL 52 facets
-  Collected 52 facets
-  Payload assembled: 52 facets, 109 memory lines
+  Total facets on disk: 60
+  Bootstrap mode: processing ALL 60 facets
+  Collected 60 facets
+  Payload assembled: 60 facets, 109 memory lines
 Stage 1 complete.
 
 Stage 2: Analyzing session data with headless Claude...
@@ -270,7 +314,8 @@ Stage 3 complete.
 ```
 
 In this run, the system:
-- Analyzed 52 sessions and found a 42% friction rate
+- Auto-generated 8 missing facets via Haiku (Stage 0)
+- Analyzed 60 sessions and found a 42% friction rate
 - Proposed 4 memory updates (new anti-patterns, lessons, and preferences)
 - Suggested 3 additions to the project's CLAUDE.md
 - Backed up existing memory before applying changes

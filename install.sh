@@ -54,7 +54,7 @@ FACETS_DIR="$HOME/.claude/usage-data/facets"
 if [ ! -d "$FACETS_DIR" ]; then
     warn "Claude Code facets directory not found at: $FACETS_DIR"
     warn "This is normal if you haven't used Claude Code yet."
-    warn "The system will start collecting data once you have sessions."
+    warn "Stage 0 will auto-generate facets from session transcripts when you run self-improve."
 fi
 
 # ─── Install ─────────────────────────────────────────────────────────────────

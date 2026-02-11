@@ -18,3 +18,5 @@ Then offer these follow-up actions:
 - "Run bootstrap" — reprocess ALL sessions: `~/.local/bin/claude-self-improve --bootstrap --interactive`
 
 If the script reports "No new sessions to analyze", suggest running with `--bootstrap` to reprocess all historical data.
+
+**Note:** Stage 0 auto-generates facets for recent sessions that don't have them (via Haiku). This means you no longer need to run `/insights` first. Use `--no-refresh` to skip facet generation and use only existing facets.
