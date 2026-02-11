@@ -149,7 +149,7 @@ fi
 
 # ─── Recall Mode (early exit) ──────────────────────────────────────────────
 if [ -n "$RECALL_QUERY" ]; then
-    RECALL_BUDGET="0.05"
+    RECALL_BUDGET="0.15"
     RECALL_PROMPT_FILE="$PROMPTS_DIR/recall.md"
 
     if [ ! -f "$RECALL_PROMPT_FILE" ]; then
@@ -232,8 +232,14 @@ for sid in all_sids:
     if not summary and not goal and not messages:
         continue
 
-    # Extract date from timestamp
-    date = timestamp[:10] if timestamp else ''
+    # Extract date from timestamp (may be ISO string or epoch millis)
+    date = ''
+    if timestamp:
+        if isinstance(timestamp, (int, float)):
+            from datetime import datetime, timezone
+            date = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
+        elif isinstance(timestamp, str):
+            date = timestamp[:10]
 
     # Find transcript path
     transcript = ''
@@ -259,8 +265,7 @@ for sid in all_sids:
 # Sort by date descending (most recent first)
 sessions.sort(key=lambda s: s.get('date', ''), reverse=True)
 
-json.dump(sessions, sys.stdout, indent=2)
-print(f'\n# {len(sessions)} sessions indexed ({len(facet_data)} facets, {len(history_data)} history entries)', file=sys.stderr)
+json.dump(sessions, sys.stdout)
 PYEOF
 
     SESSION_COUNT=$(python3 -c "import json; print(len(json.load(open('$RECALL_INDEX'))))" 2>/dev/null || echo "0")
@@ -282,6 +287,7 @@ PYEOF
         --append-system-prompt "$(cat "$RECALL_PROMPT_FILE")" \
         --output-format json \
         --model haiku \
+        --tools "" \
         --max-budget-usd "$RECALL_BUDGET" \
         > "$RECALL_OUTPUT" 2>"$DATA_DIR/recall-stderr.log"
 
@@ -294,6 +300,13 @@ PYEOF
 
     # Extract result from Claude's JSON wrapper and save as clean text
     RECALL_RESULT_FILE="$DATA_DIR/recall-result.txt"
+    # Check for budget exceeded or error
+    RECALL_SUBTYPE=$(jq -r '.subtype // ""' "$RECALL_OUTPUT" 2>/dev/null)
+    if [ "$RECALL_SUBTYPE" = "error_max_budget_usd" ]; then
+        log "ERROR: Recall query exceeded budget cap (\$$RECALL_BUDGET)"
+        log "  Session index may be too large. Try reducing facets or raising budget."
+        exit 1
+    fi
     jq -r '.result // .' "$RECALL_OUTPUT" > "$RECALL_RESULT_FILE" 2>/dev/null
 
     # Parse and display results
