@@ -132,6 +132,32 @@ Inside Claude Code:
 /self-improve
 ```
 
+### Automation (Cron)
+
+Run self-improvement automatically on a schedule:
+
+**Weekly (recommended)** — every Sunday at 9 PM:
+
+```bash
+crontab -e
+# Add this line:
+0 21 * * 0 $HOME/.local/bin/claude-self-improve >> $HOME/.local/share/claude-improve/cron.log 2>&1
+```
+
+**Daily** — every day at 9 PM:
+
+```bash
+0 21 * * * $HOME/.local/bin/claude-self-improve >> $HOME/.local/share/claude-improve/cron.log 2>&1
+```
+
+**Check logs:**
+
+```bash
+tail -50 ~/.local/share/claude-improve/cron.log
+```
+
+> **Note:** Ensure `claude` (Claude Code CLI) is on the cron `PATH`. If runs fail, add `export PATH="$HOME/.local/bin:$PATH"` before the command in your crontab, or use the full path to `claude` in the script.
+
 ## Configuration
 
 ### Environment Variables
