@@ -5,7 +5,7 @@ You are analyzing Claude Code session performance data to extract actionable sel
 ## Input
 
 You will receive a JSON payload with:
-- `facets`: Array of session facet objects (each has `friction_counts`, `friction_detail`, `outcome`, `user_satisfaction_counts`, `primary_success`, `brief_summary`, `underlying_goal`, `goal_categories`, `session_id`)
+- `facets`: Array of session facet objects (each has `friction_counts`, `friction_detail`, `outcome`, `user_satisfaction_counts`, `primary_success`, `brief_summary`, `underlying_goal`, `goal_categories`, `session_id`, `project_path`)
 - `current_memory`: Current contents of MEMORY.md
 - `memory_line_count`: Current line count of MEMORY.md
 - `previous_metrics`: Last 12 metrics snapshots (may be empty on first run)
@@ -27,7 +27,7 @@ You will receive a JSON payload with:
 
 7. **Identify domain lessons**: Any technical lessons from session summaries that aren't already in MEMORY.md.
 
-8. **Extract active threads**: Group sessions by recurring project/initiative themes using `underlying_goal` and `brief_summary`. An active thread is a topic that appears in 2+ sessions and represents ongoing work (not a one-off task). Examples: "marketing claude-self-improve", "Power BI RLS rollout", "dbt pipeline reliability". Capture the thread name, session count, last activity date, and current status (active/completed/stalled).
+8. **Extract active threads**: Group sessions by recurring project/initiative themes using `underlying_goal` and `brief_summary`. An active thread is a topic that appears in 2+ sessions and represents ongoing work (not a one-off task). Examples: "marketing claude-self-improve", "Power BI RLS rollout", "dbt pipeline reliability". Capture the thread name, session count, last activity date, and current status (active/completed/stalled). **For each thread, collect the unique `project_path` values from its constituent sessions and include them in the output as `projects`.** This enables routing thread summaries to the correct project's MEMORY.md.
 
 9. **Effectiveness analysis**: Compare this run's per-friction-type rates against `previous_metrics` to determine whether memory updates are actually reducing friction.
    - If `previous_metrics` has 2+ entries, compute the average friction rate and per-type counts from the oldest half ("baseline") and compare against the newest half + current run ("recent").
@@ -90,7 +90,8 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
       "sessions": 3,
       "last_seen": "2026-02-11",
       "status": "active",
-      "summary": "Discussed launch strategy, README improvements, cron automation docs"
+      "summary": "Discussed launch strategy, README improvements, cron automation docs",
+      "projects": ["/Users/bachillah/Documents/claude-self-improve"]
     }
   ],
   "effectiveness": {
@@ -129,6 +130,11 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
       "mostly_achieved": 12,
       "partially_achieved": 3,
       "not_achieved": 1
+    },
+    "sessions_by_project": {
+      "/Users/bachillah/Documents/living_goods/Ona": 25,
+      "/Users/bachillah/Documents/ksl/ishara": 10,
+      "unknown": 5
     }
   },
   "trend": "stable"
@@ -164,4 +170,4 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
    - `proactive_documentation` — Created docs/tickets without being asked
    - `efficient_workflow` — Completed task with minimal friction
 
-9. **Active thread detection**: Group `underlying_goal` and `brief_summary` across sessions to identify recurring project themes. A thread needs 2+ sessions to qualify. Mark threads as: `active` (seen in last 5 sessions), `stalled` (not seen in last 10 sessions), or `completed` (explicit completion signals in summary). Compare against existing `## Active Threads` section in MEMORY.md — update existing threads, add new ones, mark completed ones.
+9. **Active thread detection**: Group `underlying_goal` and `brief_summary` across sessions to identify recurring project themes. A thread needs 2+ sessions to qualify. Mark threads as: `active` (seen in last 5 sessions), `stalled` (not seen in last 10 sessions), or `completed` (explicit completion signals in summary). Compare against existing `## Active Threads` section in MEMORY.md — update existing threads, add new ones, mark completed ones. **Include `projects` array** (unique `project_path` values from constituent sessions) so threads can be routed to per-project MEMORY.md files. Also tally `sessions_by_project` in `metrics` for visibility.

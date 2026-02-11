@@ -203,10 +203,34 @@ for f in files:
     with open(f) as fh:
         facets.append(json.load(fh))
 
+# Build session -> project lookup from history.jsonl
+session_projects = {}
+history_file = os.path.expanduser('~/.claude/history.jsonl')
+if os.path.exists(history_file):
+    with open(history_file) as hf:
+        for line in hf:
+            try:
+                entry = json.loads(line.strip())
+                sid = entry.get('sessionId', '')
+                proj = entry.get('project', '')
+                if sid and proj:
+                    session_projects[sid] = proj
+            except:
+                pass
+
+# Annotate each facet with its project path
+matched = 0
+for facet in facets:
+    sid = facet.get('session_id', '')
+    proj = session_projects.get(sid, 'unknown')
+    facet['project_path'] = proj
+    if proj != 'unknown':
+        matched += 1
+
 with open('$FACETS_TMP', 'w') as out:
     json.dump(facets, out)
 
-print(f'Collected {len(facets)} facets')
+print(f'Collected {len(facets)} facets ({matched}/{len(facets)} matched to projects)')
 " 2>&1 | while read -r line; do log "  $line"; done
 
 # Write previous metrics to temp file
@@ -550,6 +574,177 @@ else
 
     log ""
     log "Stage 3 complete."
+fi
+
+# ─── Stage 3.5: Route Threads to Per-Project MEMORY.md ──────────────────────
+THREAD_COUNT=$(echo "$CLEAN_ANALYSIS" | jq -r '.active_threads | length // 0' 2>/dev/null)
+
+if [ "$THREAD_COUNT" -gt 0 ] 2>/dev/null && [ "$DRY_RUN" = false ]; then
+    log ""
+    log "Stage 3.5: Routing threads to per-project MEMORY.md files..."
+
+    THREAD_ROUTING=$(ANALYSIS_FILE="$ANALYSIS_FILE" python3 << 'PYEOF'
+import json, os, re
+
+analysis_file = os.environ.get('ANALYSIS_FILE', '')
+with open(analysis_file) as f:
+    analysis = json.load(f)
+
+threads = analysis.get('active_threads', [])
+if not threads:
+    print(json.dumps({"routed": [], "skipped": []}))
+    exit(0)
+
+# Group threads by project
+project_threads = {}  # {project_path: [thread, ...]}
+for t in threads:
+    projects = t.get('projects', [])
+    for proj in projects:
+        if proj and proj != 'unknown':
+            project_threads.setdefault(proj, []).append(t)
+
+# For each project, check if MEMORY.md exists and write threads
+claude_projects_dir = os.path.expanduser('~/.claude/projects')
+routed = []
+skipped = []
+
+for proj_path, proj_threads in project_threads.items():
+    # Encode project path to Claude's directory naming convention
+    # /Users/bachillah/Documents/living_goods/Ona -> -Users-bachillah-Documents-living-goods-Ona
+    # Replace path separators with hyphens, handle underscores->hyphens
+    encoded = proj_path.replace('/', '-').lstrip('-')
+    # Claude Code also replaces underscores with hyphens in directory names
+    encoded_underscore = proj_path.replace('/', '-').replace('_', '-').lstrip('-')
+
+    # Try both encodings (with and without underscore replacement)
+    memory_path = None
+    for enc in [encoded, encoded_underscore]:
+        candidate = os.path.join(claude_projects_dir, f'-{enc}', 'memory', 'MEMORY.md')
+        if os.path.exists(candidate):
+            memory_path = candidate
+            break
+
+    if not memory_path:
+        skipped.append({
+            "project": proj_path,
+            "threads": [t['thread'] for t in proj_threads],
+            "reason": "no MEMORY.md"
+        })
+        continue
+
+    # Build the ## Active Threads section
+    lines = ["## Active Threads"]
+    for t in proj_threads:
+        status = t.get('status', 'active')
+        sessions = t.get('sessions', 0)
+        last_seen = t.get('last_seen', '?')
+        summary = t.get('summary', '')
+        lines.append(f"- **{t['thread']}** ({sessions} sessions, last: {last_seen}) — {status}")
+        if summary:
+            lines.append(f"  {summary}")
+    thread_section = '\n'.join(lines) + '\n'
+
+    # Read existing MEMORY.md
+    with open(memory_path) as f:
+        content = f.read()
+
+    # Replace existing ## Active Threads section, or append before last section
+    pattern = r'## Active Threads\n(?:(?!## ).+\n)*'
+    if re.search(pattern, content):
+        # Replace existing section
+        new_content = re.sub(pattern, thread_section + '\n', content)
+    else:
+        # Append before the last ## section (or at end if no sections)
+        sections = list(re.finditer(r'^## ', content, re.MULTILINE))
+        if len(sections) >= 2:
+            # Insert before the last section
+            insert_pos = sections[-1].start()
+            new_content = content[:insert_pos] + thread_section + '\n' + content[insert_pos:]
+        else:
+            # Append at end
+            new_content = content.rstrip() + '\n\n' + thread_section
+
+    # Check line count before writing
+    new_line_count = new_content.count('\n')
+    if new_line_count > 200:
+        skipped.append({
+            "project": proj_path,
+            "threads": [t['thread'] for t in proj_threads],
+            "reason": f"would exceed 200 lines ({new_line_count})"
+        })
+        continue
+
+    with open(memory_path, 'w') as f:
+        f.write(new_content)
+
+    routed.append({
+        "project": proj_path,
+        "memory_path": memory_path,
+        "threads": [{"thread": t['thread'], "sessions": t.get('sessions', 0)} for t in proj_threads]
+    })
+
+print(json.dumps({"routed": routed, "skipped": skipped}))
+PYEOF
+    )
+
+    # Display thread routing results
+    log ""
+    log "  Thread Routing:"
+    log "  ─────────────────────────────"
+    echo "$THREAD_ROUTING" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for r in data.get('routed', []):
+    proj = r['project']
+    count = len(r['threads'])
+    print(f'  {proj} ({count} thread(s) written)')
+    for t in r['threads']:
+        print(f\"    {t['thread']} ({t['sessions']} sessions)\")
+for s in data.get('skipped', []):
+    proj = s['project']
+    reason = s['reason']
+    print(f'  {proj} (skipped — {reason})')
+    for t in s.get('threads', []):
+        print(f'    {t}')
+" 2>/dev/null | while IFS= read -r line; do log "$line"; done
+
+    log ""
+    log "Stage 3.5 complete."
+elif [ "$THREAD_COUNT" -gt 0 ] 2>/dev/null && [ "$DRY_RUN" = true ]; then
+    log ""
+    log "Stage 3.5: Thread routing (dry-run, not writing)..."
+
+    # Still show what WOULD be routed
+    echo "$CLEAN_ANALYSIS" | python3 -c "
+import json, sys, os, re
+
+analysis = json.load(sys.stdin)
+threads = analysis.get('active_threads', [])
+claude_projects_dir = os.path.expanduser('~/.claude/projects')
+
+# Group by project
+project_threads = {}
+for t in threads:
+    for proj in t.get('projects', []):
+        if proj and proj != 'unknown':
+            project_threads.setdefault(proj, []).append(t)
+
+print('  Thread Routing (dry-run):')
+print('  ─────────────────────────────')
+for proj_path, proj_threads in project_threads.items():
+    encoded = proj_path.replace('/', '-').replace('_', '-').lstrip('-')
+    candidate = os.path.join(claude_projects_dir, f'-{encoded}', 'memory', 'MEMORY.md')
+    exists = os.path.exists(candidate)
+    if not exists:
+        encoded2 = proj_path.replace('/', '-').lstrip('-')
+        candidate = os.path.join(claude_projects_dir, f'-{encoded2}', 'memory', 'MEMORY.md')
+        exists = os.path.exists(candidate)
+    status = f'{len(proj_threads)} thread(s) would be written' if exists else 'skipped — no MEMORY.md'
+    print(f'  {proj_path} ({status})')
+    for t in proj_threads:
+        print(f\"    {t['thread']} ({t.get('sessions', '?')} sessions)\")
+" 2>/dev/null | while IFS= read -r line; do log "$line"; done
+    log ""
 fi
 
 # ─── Update State ────────────────────────────────────────────────────────────
