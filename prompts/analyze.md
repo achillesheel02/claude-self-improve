@@ -29,6 +29,13 @@ You will receive a JSON payload with:
 
 8. **Extract active threads**: Group sessions by recurring project/initiative themes using `underlying_goal` and `brief_summary`. An active thread is a topic that appears in 2+ sessions and represents ongoing work (not a one-off task). Examples: "marketing claude-self-improve", "Power BI RLS rollout", "dbt pipeline reliability". Capture the thread name, session count, last activity date, and current status (active/completed/stalled).
 
+9. **Effectiveness analysis**: Compare this run's per-friction-type rates against `previous_metrics` to determine whether memory updates are actually reducing friction.
+   - If `previous_metrics` has 2+ entries, compute the average friction rate and per-type counts from the oldest half ("baseline") and compare against the newest half + current run ("recent").
+   - For each friction type, compute delta (recent - baseline). Negative = improving.
+   - Correlate improvements with specific `memory_updates` or `claude_md_suggestions` from previous runs (listed in `current_memory`) — e.g., if "investigation-first rule" was added and `wrong_approach` dropped, flag as `likely_effective`.
+   - If `previous_metrics` has <2 entries (bootstrap or early runs), set `has_baseline: false` and skip comparison. This run becomes the baseline for future comparisons.
+   - Overall verdict: `improving` (aggregate friction rate dropped >5%), `stable` (within +/-5%), `regressing` (rose >5%), or `insufficient_data`.
+
 ## Output Format
 
 Return ONLY valid JSON (no markdown code fences, no commentary):
@@ -86,6 +93,23 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
       "summary": "Discussed launch strategy, README improvements, cron automation docs"
     }
   ],
+  "effectiveness": {
+    "has_baseline": true,
+    "baseline_runs": 3,
+    "baseline_friction_rate": 0.42,
+    "current_friction_rate": 0.35,
+    "friction_rate_delta": -0.07,
+    "satisfaction_delta": 0.3,
+    "outcome_delta": 0.05,
+    "per_type_changes": [
+      {"type": "wrong_approach", "baseline_count": 12, "current_count": 7, "delta": -5, "verdict": "improving"},
+      {"type": "misunderstood_request", "baseline_count": 8, "current_count": 9, "delta": 1, "verdict": "stable"}
+    ],
+    "likely_effective_updates": [
+      "Investigation-first rule (CLAUDE.md) → wrong_approach -5 sessions"
+    ],
+    "overall_verdict": "improving"
+  },
   "metrics": {
     "timestamp": "2026-02-10T20:00:00Z",
     "sessions_analyzed": 10,
@@ -93,7 +117,19 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
     "avg_satisfaction": 3.2,
     "top_friction": "wrong_approach",
     "top_success": "good_debugging",
-    "outcome_success_rate": 0.80
+    "outcome_success_rate": 0.80,
+    "friction_by_type": {
+      "wrong_approach": 12,
+      "misunderstood_request": 8,
+      "unnecessary_changes": 3,
+      "buggy_code": 2
+    },
+    "outcome_counts": {
+      "fully_achieved": 8,
+      "mostly_achieved": 12,
+      "partially_achieved": 3,
+      "not_achieved": 1
+    }
   },
   "trend": "stable"
 }

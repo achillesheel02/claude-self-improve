@@ -375,6 +375,50 @@ if [ "$UPDATE_COUNT" -gt 0 ] 2>/dev/null; then
     done
 fi
 
+# ─── Effectiveness Report ───────────────────────────────────────────────────
+HAS_BASELINE=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.has_baseline // false' 2>/dev/null)
+if [ "$HAS_BASELINE" = "true" ]; then
+    EFF_VERDICT=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.overall_verdict // "unknown"' 2>/dev/null)
+    EFF_BASELINE_FR=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.baseline_friction_rate // "?"' 2>/dev/null)
+    EFF_CURRENT_FR=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.current_friction_rate // "?"' 2>/dev/null)
+    EFF_FR_DELTA=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.friction_rate_delta // "?"' 2>/dev/null)
+    EFF_SAT_DELTA=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.satisfaction_delta // "?"' 2>/dev/null)
+    EFF_OUT_DELTA=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.outcome_delta // "?"' 2>/dev/null)
+
+    log ""
+    log "  Effectiveness Report:"
+    log "  ─────────────────────────────"
+    log "  Overall verdict:    $EFF_VERDICT"
+    log "  Friction rate:      $EFF_BASELINE_FR → $EFF_CURRENT_FR (delta: $EFF_FR_DELTA)"
+    log "  Satisfaction delta: $EFF_SAT_DELTA"
+    log "  Outcome delta:      $EFF_OUT_DELTA"
+
+    # Per-type changes
+    TYPE_CHANGES=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.per_type_changes[]? | "    \(.type): \(.baseline_count) → \(.current_count) (\(.verdict))"' 2>/dev/null)
+    if [ -n "$TYPE_CHANGES" ]; then
+        log "  Per-type friction changes:"
+        echo "$TYPE_CHANGES" | while IFS= read -r line; do
+            log "$line"
+        done
+    fi
+
+    # Likely effective updates
+    EFFECTIVE_UPDATES=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.likely_effective_updates[]?' 2>/dev/null)
+    if [ -n "$EFFECTIVE_UPDATES" ]; then
+        log "  Likely effective memory updates:"
+        echo "$EFFECTIVE_UPDATES" | while IFS= read -r line; do
+            log "    ✓ $line"
+        done
+    fi
+    log ""
+else
+    BASELINE_RUNS=$(echo "$CLEAN_ANALYSIS" | jq -r '.effectiveness.baseline_runs // 0' 2>/dev/null)
+    log ""
+    log "  Effectiveness Report: insufficient data (need 2+ previous runs, have $BASELINE_RUNS)"
+    log "  This run establishes baseline metrics for future comparison."
+    log ""
+fi
+
 # Save CLAUDE.md suggestions (never auto-applied)
 if [ "$SUGGESTION_COUNT" -gt 0 ] 2>/dev/null; then
     echo "# CLAUDE.md Suggestions ($(date '+%Y-%m-%d'))" > "$SUGGESTIONS_FILE"
@@ -509,6 +553,7 @@ else
 fi
 
 # ─── Update State ────────────────────────────────────────────────────────────
+EFF_VERDICT_SAFE="${EFF_VERDICT:-insufficient_data}"
 cat > "$LAST_RUN" << EOF
 {
     "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
@@ -516,7 +561,8 @@ cat > "$LAST_RUN" << EOF
     "sessions_analyzed": $SESSIONS,
     "friction_rate": "$FRICTION_RATE",
     "trend": "$TREND",
-    "updates_applied": $UPDATE_COUNT
+    "updates_applied": $UPDATE_COUNT,
+    "effectiveness_verdict": "$EFF_VERDICT_SAFE"
 }
 EOF
 
@@ -524,10 +570,17 @@ log ""
 log "═══════════════════════════════════════════════════"
 log "  SELF-IMPROVEMENT RUN COMPLETE"
 log "  Sessions: $SESSIONS | Friction: $FRICTION_RATE | Trend: $TREND"
+if [ "$HAS_BASELINE" = "true" ]; then
+    log "  Effectiveness: $EFF_VERDICT (friction delta: $EFF_FR_DELTA)"
+fi
 log "  Memory updates: $UPDATE_COUNT applied"
 log "═══════════════════════════════════════════════════"
 
 # macOS notification (silently skip on Linux)
-osascript -e "display notification \"Sessions: $SESSIONS | Friction: $FRICTION_RATE | Trend: $TREND\" with title \"Claude Self-Improve\" subtitle \"$UPDATE_COUNT memory updates applied\"" 2>/dev/null
+NOTIF_BODY="Sessions: $SESSIONS | Friction: $FRICTION_RATE | Trend: $TREND"
+if [ "$HAS_BASELINE" = "true" ]; then
+    NOTIF_BODY="$NOTIF_BODY | Verdict: $EFF_VERDICT"
+fi
+osascript -e "display notification \"$NOTIF_BODY\" with title \"Claude Self-Improve\" subtitle \"$UPDATE_COUNT memory updates applied\"" 2>/dev/null
 
 exit 0
