@@ -5,6 +5,14 @@
 
 set +e
 
+# Prevent concurrent runs (cron + manual overlap)
+LOCKDIR="/tmp/claude-self-improve.lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    echo "Another claude-self-improve instance is running. Exiting."
+    exit 1
+fi
+trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATA_DIR="${CLAUDE_IMPROVE_DATA_DIR:-$HOME/.local/share/claude-improve}"
 PROMPTS_DIR="$DATA_DIR/prompts"
@@ -333,9 +341,10 @@ PYEOF
 CLEAN_ANALYSIS=$(echo "$ANALYSIS_RESULT" | python3 "$PARSE_SCRIPT" 2>/dev/null)
 
 if [ $? -ne 0 ]; then
-    log "WARNING: Could not parse analysis as JSON. Raw output saved to $ANALYSIS_FILE"
-    log "  Attempting to continue with raw output..."
-    CLEAN_ANALYSIS="$ANALYSIS_RESULT"
+    log "ERROR: Could not parse analysis as JSON."
+    log "  Raw output saved to: $ANALYSIS_FILE"
+    log "  Fix: re-run or check $DATA_DIR/analyze-stderr.log"
+    exit 1
 fi
 
 echo "$CLEAN_ANALYSIS" > "$ANALYSIS_FILE"
