@@ -5,7 +5,7 @@ You are analyzing Claude Code session performance data to extract actionable sel
 ## Input
 
 You will receive a JSON payload with:
-- `facets`: Array of session facet objects (each has `friction_counts`, `friction_detail`, `outcome`, `user_satisfaction_counts`, `primary_success`, `brief_summary`, `session_id`)
+- `facets`: Array of session facet objects (each has `friction_counts`, `friction_detail`, `outcome`, `user_satisfaction_counts`, `primary_success`, `brief_summary`, `underlying_goal`, `goal_categories`, `session_id`)
 - `current_memory`: Current contents of MEMORY.md
 - `memory_line_count`: Current line count of MEMORY.md
 - `previous_metrics`: Last 12 metrics snapshots (may be empty on first run)
@@ -26,6 +26,8 @@ You will receive a JSON payload with:
 6. **Extract user preferences**: From satisfaction patterns and friction details, infer working style preferences. What triggers dissatisfaction? What correlates with high satisfaction?
 
 7. **Identify domain lessons**: Any technical lessons from session summaries that aren't already in MEMORY.md.
+
+8. **Extract active threads**: Group sessions by recurring project/initiative themes using `underlying_goal` and `brief_summary`. An active thread is a topic that appears in 2+ sessions and represents ongoing work (not a one-off task). Examples: "marketing claude-self-improve", "Power BI RLS rollout", "dbt pipeline reliability". Capture the thread name, session count, last activity date, and current status (active/completed/stalled).
 
 ## Output Format
 
@@ -75,6 +77,15 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
       "sessions_seen": 5
     }
   ],
+  "active_threads": [
+    {
+      "thread": "Marketing claude-self-improve",
+      "sessions": 3,
+      "last_seen": "2026-02-11",
+      "status": "active",
+      "summary": "Discussed launch strategy, README improvements, cron automation docs"
+    }
+  ],
   "metrics": {
     "timestamp": "2026-02-10T20:00:00Z",
     "sessions_analyzed": 10,
@@ -116,3 +127,5 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
    - `multi_file_changes` — Well-coordinated multi-file edits
    - `proactive_documentation` — Created docs/tickets without being asked
    - `efficient_workflow` — Completed task with minimal friction
+
+9. **Active thread detection**: Group `underlying_goal` and `brief_summary` across sessions to identify recurring project themes. A thread needs 2+ sessions to qualify. Mark threads as: `active` (seen in last 5 sessions), `stalled` (not seen in last 10 sessions), or `completed` (explicit completion signals in summary). Compare against existing `## Active Threads` section in MEMORY.md — update existing threads, add new ones, mark completed ones.

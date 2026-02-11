@@ -23,6 +23,16 @@ Create a new `.md` file in the memory directory. Add a one-line reference in a "
 ### `archive_to_topic`
 Move verbose content from MEMORY.md to a topic file, leaving a one-line link in MEMORY.md.
 
+### `update_active_threads`
+Maintain an `## Active Threads` section in MEMORY.md. This section tracks ongoing project initiatives across sessions. Each thread is a single bullet:
+- **Thread Name** (N sessions, last: YYYY-MM-DD): One-line summary of current state
+
+Rules for this section:
+- Add new threads when first detected (2+ sessions)
+- Update existing threads with new session count and summary
+- Move completed/stalled threads to a `## Completed Threads` subsection (or remove after 2 runs with no activity)
+- This section should not exceed 10 active threads (archive older ones)
+
 ## Rules
 
 1. **Read before writing**: Always read the current file before making changes.
