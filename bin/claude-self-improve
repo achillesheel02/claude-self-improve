@@ -483,6 +483,55 @@ fi
 # ─── Dry-run Exit ────────────────────────────────────────────────────────────
 if [ "$DRY_RUN" = true ]; then
     log "Dry-run mode: skipping Stage 3 (memory update)."
+
+    # Show thread routing preview even in dry-run
+    THREAD_COUNT=$(echo "$CLEAN_ANALYSIS" | jq -r '.active_threads | length // 0' 2>/dev/null)
+    if [ "$THREAD_COUNT" -gt 0 ] 2>/dev/null; then
+        log ""
+        log "Stage 3.5: Thread routing (dry-run preview)..."
+        echo "$CLEAN_ANALYSIS" | python3 -c "
+import json, sys, os
+
+analysis = json.load(sys.stdin)
+threads = analysis.get('active_threads', [])
+claude_projects_dir = os.path.expanduser('~/.claude/projects')
+
+# Group by project
+project_threads = {}
+untagged = []
+for t in threads:
+    projects = t.get('projects', [])
+    if not projects:
+        untagged.append(t)
+        continue
+    for proj in projects:
+        if proj and proj != 'unknown':
+            project_threads.setdefault(proj, []).append(t)
+        else:
+            untagged.append(t)
+
+print('  Thread Routing (dry-run):')
+print('  ─────────────────────────────')
+for proj_path, pt in project_threads.items():
+    encoded = proj_path.replace('/', '-').replace('_', '-').lstrip('-')
+    candidate = os.path.join(claude_projects_dir, f'-{encoded}', 'memory', 'MEMORY.md')
+    exists = os.path.exists(candidate)
+    if not exists:
+        encoded2 = proj_path.replace('/', '-').lstrip('-')
+        candidate = os.path.join(claude_projects_dir, f'-{encoded2}', 'memory', 'MEMORY.md')
+        exists = os.path.exists(candidate)
+    status = f'{len(pt)} thread(s) would be written' if exists else 'skipped — no MEMORY.md'
+    print(f'  {proj_path} ({status})')
+    for t in pt:
+        print(f\"    {t['thread']} ({t.get('sessions', '?')} sessions)\")
+if untagged:
+    print(f'  (untagged) {len(untagged)} thread(s) — no project_path from analysis')
+    for t in untagged:
+        print(f\"    {t['thread']} ({t.get('sessions', '?')} sessions)\")
+" 2>/dev/null | while IFS= read -r line; do log "$line"; done
+    fi
+
+    log ""
     log "Analysis saved to: $ANALYSIS_FILE"
     exit 0
 fi
