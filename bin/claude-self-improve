@@ -1,7 +1,7 @@
 #!/bin/bash
 # Claude Self-Improvement System
 # Analyzes Claude Code session performance data and updates persistent memory
-# Usage: claude-self-improve [--interactive] [--bootstrap] [--dry-run] [--memory-dir DIR]
+# Usage: claude-self-improve [--interactive] [--bootstrap] [--dry-run] [--recall "query"] [--memory-dir DIR]
 
 set +e
 
@@ -51,12 +51,17 @@ UPDATE_BUDGET="0.30"
 INTERACTIVE=false
 BOOTSTRAP=false
 DRY_RUN=false
+RECALL_QUERY=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --interactive) INTERACTIVE=true; shift ;;
         --bootstrap)   BOOTSTRAP=true; shift ;;
         --dry-run)     DRY_RUN=true; shift ;;
+        --recall)
+            RECALL_QUERY="$2"
+            shift 2
+            ;;
         --memory-dir)
             MEMORY_DIR="$2"
             MEMORY_FILE="$MEMORY_DIR/MEMORY.md"
@@ -71,6 +76,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --interactive      Show proposed changes and ask for confirmation"
             echo "  --bootstrap        Process ALL existing facets (first run or reprocess)"
             echo "  --dry-run          Run analysis but don't update any files"
+            echo "  --recall QUERY     Search past sessions by semantic similarity"
             echo "  --memory-dir DIR   Path to Claude Code memory directory"
             echo "                     (auto-detected if not set)"
             echo ""
@@ -78,10 +84,14 @@ while [[ $# -gt 0 ]]; do
             echo "  CLAUDE_MEMORY_DIR       Override memory directory path"
             echo "  CLAUDE_IMPROVE_DATA_DIR Override data directory (default: ~/.local/share/claude-improve)"
             echo ""
-            echo "Stages:"
+            echo "Stages (analysis mode):"
             echo "  1. Collect  — Gathers session facets from ~/.claude/usage-data/facets/"
             echo "  2. Analyze  — Sends to headless Claude (Sonnet) for pattern extraction"
             echo "  3. Update   — Applies memory updates via headless Claude (Sonnet)"
+            echo ""
+            echo "Recall mode (--recall):"
+            echo "  Searches session history using headless Claude (Haiku) for semantic matching."
+            echo "  Example: claude-self-improve --recall \"monetization strategy\""
             echo ""
             exit 0
             ;;
@@ -135,6 +145,224 @@ if [ -d "$REPO_PROMPTS" ]; then
     for f in "$REPO_PROMPTS"/*.md; do
         [ -f "$f" ] && cp -n "$f" "$PROMPTS_DIR/" 2>/dev/null
     done
+fi
+
+# ─── Recall Mode (early exit) ──────────────────────────────────────────────
+if [ -n "$RECALL_QUERY" ]; then
+    RECALL_BUDGET="0.05"
+    RECALL_PROMPT_FILE="$PROMPTS_DIR/recall.md"
+
+    if [ ! -f "$RECALL_PROMPT_FILE" ]; then
+        log "ERROR: Recall prompt not found at $RECALL_PROMPT_FILE"
+        log "  Run install.sh or copy prompts/ to $PROMPTS_DIR/"
+        exit 1
+    fi
+
+    log "Session Recall: \"$RECALL_QUERY\""
+    log "─────────────────────────────────────────────"
+
+    # Build session index from facets + history.jsonl
+    RECALL_INDEX="$DATA_DIR/recall-index.json"
+    RECALL_INPUT="$DATA_DIR/recall-input.txt"
+
+    python3 << 'PYEOF' > "$RECALL_INDEX"
+import json, glob, os, sys
+from collections import defaultdict
+
+facets_dir = os.path.expanduser('~/.claude/usage-data/facets')
+history_file = os.path.expanduser('~/.claude/history.jsonl')
+claude_projects_dir = os.path.expanduser('~/.claude/projects')
+
+# 1. Read all facets -> {session_id: {summary, goal}}
+facet_data = {}
+for f in sorted(glob.glob(os.path.join(facets_dir, '*.json')), key=os.path.getmtime):
+    try:
+        with open(f) as fh:
+            d = json.load(fh)
+            sid = d.get('session_id', '')
+            if sid:
+                facet_data[sid] = {
+                    'summary': d.get('brief_summary', ''),
+                    'goal': d.get('underlying_goal', ''),
+                }
+    except:
+        pass
+
+# 2. Read history.jsonl -> {sessionId: {project, messages, timestamp}}
+history_data = defaultdict(lambda: {'project': '', 'messages': [], 'timestamp': '', 'msg_count': 0})
+if os.path.exists(history_file):
+    with open(history_file) as hf:
+        for line in hf:
+            try:
+                entry = json.loads(line.strip())
+                sid = entry.get('sessionId', '')
+                if not sid:
+                    continue
+                h = history_data[sid]
+                proj = entry.get('project', '')
+                if proj:
+                    h['project'] = proj
+                ts = entry.get('timestamp', '')
+                if ts:
+                    h['timestamp'] = ts
+                # Collect first 3 user messages
+                display = entry.get('display', '')
+                if display and h['msg_count'] < 3:
+                    # Truncate long messages
+                    h['messages'].append(display[:200])
+                    h['msg_count'] += 1
+            except:
+                pass
+
+# 3. Merge into session index
+sessions = []
+all_sids = set(list(facet_data.keys()) + list(history_data.keys()))
+
+for sid in all_sids:
+    facet = facet_data.get(sid, {})
+    hist = history_data.get(sid, {})
+
+    summary = facet.get('summary', '')
+    goal = facet.get('goal', '')
+    project = hist.get('project', '') if hist else ''
+    messages = hist.get('messages', []) if hist else []
+    timestamp = hist.get('timestamp', '') if hist else ''
+
+    # Skip sessions with no useful metadata
+    if not summary and not goal and not messages:
+        continue
+
+    # Extract date from timestamp
+    date = timestamp[:10] if timestamp else ''
+
+    # Find transcript path
+    transcript = ''
+    if project:
+        encoded = project.replace('/', '-').lstrip('-')
+        encoded_us = project.replace('/', '-').replace('_', '-').lstrip('-')
+        for enc in [encoded, encoded_us]:
+            candidate = os.path.join(claude_projects_dir, f'-{enc}', f'{sid}.jsonl')
+            if os.path.exists(candidate):
+                transcript = candidate
+                break
+
+    sessions.append({
+        'session_id': sid,
+        'project': project,
+        'date': date,
+        'summary': summary,
+        'goal': goal,
+        'messages': messages,
+        'transcript': transcript,
+    })
+
+# Sort by date descending (most recent first)
+sessions.sort(key=lambda s: s.get('date', ''), reverse=True)
+
+json.dump(sessions, sys.stdout, indent=2)
+print(f'\n# {len(sessions)} sessions indexed ({len(facet_data)} facets, {len(history_data)} history entries)', file=sys.stderr)
+PYEOF
+
+    SESSION_COUNT=$(python3 -c "import json; print(len(json.load(open('$RECALL_INDEX'))))" 2>/dev/null || echo "0")
+    log "  Indexed $SESSION_COUNT sessions from facets + history"
+
+    # Build recall input for Haiku
+    {
+        echo "Find sessions matching this query: $RECALL_QUERY"
+        echo ""
+        echo "=== SESSION INDEX ==="
+        cat "$RECALL_INDEX"
+    } > "$RECALL_INPUT"
+
+    log "  Querying headless Claude (Haiku)..."
+
+    # Call headless Claude with Haiku
+    RECALL_OUTPUT="$DATA_DIR/recall-output.json"
+    cat "$RECALL_INPUT" | claude -p - \
+        --append-system-prompt "$(cat "$RECALL_PROMPT_FILE")" \
+        --output-format json \
+        --model haiku \
+        --max-budget-usd "$RECALL_BUDGET" \
+        > "$RECALL_OUTPUT" 2>"$DATA_DIR/recall-stderr.log"
+
+    RECALL_EXIT=$?
+    if [ $RECALL_EXIT -ne 0 ]; then
+        log "ERROR: Recall query failed (exit code $RECALL_EXIT)"
+        log "  Check $DATA_DIR/recall-stderr.log"
+        exit 1
+    fi
+
+    # Extract result from Claude's JSON wrapper and save as clean text
+    RECALL_RESULT_FILE="$DATA_DIR/recall-result.txt"
+    jq -r '.result // .' "$RECALL_OUTPUT" > "$RECALL_RESULT_FILE" 2>/dev/null
+
+    # Parse and display results
+    RECALL_DISPLAY_SCRIPT="$DATA_DIR/recall-display.py"
+    cat > "$RECALL_DISPLAY_SCRIPT" << 'PYEOF'
+import json, sys, os, re
+
+result_file = sys.argv[1]
+index_file = sys.argv[2]
+
+with open(result_file) as f:
+    raw = f.read().strip()
+
+# Strip markdown fences if present
+raw = re.sub(r'^```json\s*', '', raw)
+raw = re.sub(r'\s*```$', '', raw)
+
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    # Try to find JSON in text
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if match:
+        data = json.loads(match.group())
+    else:
+        print('ERROR: Could not parse recall results as JSON')
+        print(f'Raw: {raw[:500]}')
+        sys.exit(1)
+
+matches = data.get('matches', [])
+
+# Load session index to look up transcript paths
+transcript_map = {}
+if os.path.exists(index_file):
+    with open(index_file) as f:
+        for s in json.load(f):
+            transcript_map[s['session_id']] = s.get('transcript', '')
+
+if not matches:
+    print('  No matching sessions found.')
+    sys.exit(0)
+
+for i, m in enumerate(matches, 1):
+    sid = m.get('session_id', '?')
+    project = m.get('project', '?')
+    date = m.get('date', '?')
+    relevance = m.get('relevance', '?').upper()
+    reason = m.get('reason', '')
+    summary = m.get('summary', '')
+    transcript = transcript_map.get(sid, '')
+
+    print(f'  {i}. [{relevance}] {date} — {project}')
+    print(f'     {reason}')
+    if summary:
+        print(f'     Summary: {summary}')
+    if transcript:
+        print(f'     Transcript: {transcript}')
+    else:
+        print(f'     Session ID: {sid}')
+    print()
+
+print(f'  Found {len(matches)} matching session(s).')
+PYEOF
+
+    python3 "$RECALL_DISPLAY_SCRIPT" "$RECALL_RESULT_FILE" "$RECALL_INDEX" 2>&1 | while IFS= read -r line; do log "$line"; done
+
+    # Clean up
+    rm -f "$RECALL_INDEX" "$RECALL_INPUT"
+    exit 0
 fi
 
 log "═══════════════════════════════════════════════════"
