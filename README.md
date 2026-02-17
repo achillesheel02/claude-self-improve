@@ -93,7 +93,8 @@ cd claude-self-improve
 This installs:
 - `~/.local/bin/claude-self-improve` — main script
 - `~/.local/share/claude-improve/prompts/` — analysis and update prompts
-- `~/.claude/commands/self-improve.md` — slash command for Claude Code
+- `~/.claude/commands/self-improve.md` — `/self-improve` slash command for Claude Code
+- `~/.claude/commands/recall.md` — `/recall` slash command for session search
 
 ### Uninstall
 
@@ -149,13 +150,36 @@ Force facet generation even if facets are fresh:
 claude-self-improve --refresh-facets
 ```
 
-### Slash Command
+### Slash Commands
 
-Inside Claude Code:
+The installer adds two slash commands to Claude Code (`~/.claude/commands/`):
+
+#### `/self-improve`
+
+Run the full self-improvement pipeline interactively from within Claude Code:
 
 ```
 /self-improve
 ```
+
+This triggers `claude-self-improve --interactive`, showing sessions analyzed, friction rate, trends, and memory updates. After completion it offers follow-up actions like viewing friction trends or reviewing CLAUDE.md suggestions.
+
+> **Note:** Running `/self-improve` from within Claude Code may fail due to nested session detection (it spawns a headless Claude instance). If this happens, run it in a separate terminal instead:
+> ```bash
+> claude-self-improve --interactive
+> ```
+
+#### `/recall`
+
+Search past Claude Code sessions for conversations matching a query:
+
+```
+/recall kubernetes deployment issue
+/recall "how did we fix the RLS bug"
+/recall dim_chw cross-source
+```
+
+This runs a semantic search across your session transcripts and returns matching sessions with relevance level, date, project, and transcript path. Useful for finding how you solved a problem before, or picking up where you left off on a previous task.
 
 ### Automation (Cron)
 
