@@ -10,6 +10,10 @@ Thumbs.db
 .idea/
 
 # Runtime data (created during execution, not part of repo)
-*.json
 *.jsonl
 *.log
+
+# MCP server
+mcp-server/node_modules/
+mcp-server/dist/
+mcp-server/package-lock.json

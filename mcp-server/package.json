@@ -1,0 +1,47 @@
+{
+  "name": "@bachillah/claude-improve-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Claude self-improvement — facet capture, analysis, memory management, and recall",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "bin": {
+    "claude-improve-mcp": "dist/bin/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/achillesheel02/claude-self-improve",
+    "directory": "mcp-server"
+  },
+  "author": "achillesheel02",
+  "homepage": "https://github.com/achillesheel02/claude-self-improve/tree/main/mcp-server#readme",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "prepare": "npm run build"
+  },
+  "files": [
+    "dist",
+    "src/prompts"
+  ],
+  "keywords": [
+    "claude",
+    "mcp",
+    "self-improvement",
+    "memory",
+    "facets"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^12.6.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

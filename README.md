@@ -344,6 +344,21 @@ In this run, the system:
 - Suggested 3 additions to the project's CLAUDE.md
 - Backed up existing memory before applying changes
 
+## MCP Server (Claude.ai Desktop App)
+
+The `mcp-server/` directory contains an MCP server that brings self-improvement to **Claude.ai Desktop App** users. Instead of batch post-hoc analysis, it uses inline reflection — Claude generates facets during the conversation.
+
+Both the bash script and MCP server share the same SQLite database (`~/.claude-improve/facets.db`).
+
+See [`mcp-server/README.md`](mcp-server/README.md) for setup instructions.
+
+```bash
+# Quick start
+cd mcp-server && npm install
+npx claude-improve-mcp init
+npx claude-improve-mcp migrate  # import existing facets
+```
+
 ## License
 
 MIT

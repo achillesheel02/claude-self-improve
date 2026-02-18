@@ -5,6 +5,12 @@
 
 set +e
 
+# Allow running from within Claude Code sessions.
+# The script calls `claude -p` (headless mode) which detects CLAUDECODE
+# and refuses to start, thinking it's a nested session. These are independent
+# headless invocations, not actual nested sessions, so it's safe to unset.
+unset CLAUDECODE
+
 # Prevent concurrent runs (cron + manual overlap)
 LOCKDIR="/tmp/claude-self-improve.lock"
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
@@ -18,6 +24,7 @@ DATA_DIR="${CLAUDE_IMPROVE_DATA_DIR:-$HOME/.local/share/claude-improve}"
 PROMPTS_DIR="$DATA_DIR/prompts"
 BACKUPS_DIR="$DATA_DIR/backups"
 FACETS_DIR="$HOME/.claude/usage-data/facets"
+SQLITE_DB="$HOME/.claude-improve/facets.db"
 
 # Auto-detect memory directory: check env var, then find active project memory
 if [ -n "$CLAUDE_MEMORY_DIR" ]; then
@@ -44,8 +51,15 @@ LOG_FILE="$DATA_DIR/run.log"
 MAX_BACKUPS=10
 
 # Cost caps
-ANALYZE_BUDGET="0.50"
+ANALYZE_BUDGET="1.00"
 UPDATE_BUDGET="0.30"
+META_BUDGET="0.50"
+
+# Facet model routing
+FACET_MODEL="sonnet"              # Default: sonnet for quality (override: --facet-model haiku)
+FACET_BUDGET_HAIKU="0.05"
+FACET_BUDGET_SONNET="0.15"
+FACET_SIZE_THRESHOLD_LOW=5120     # Below 5KB transcript chars -> Haiku
 
 # ─── Parse Arguments ─────────────────────────────────────────────────────────
 INTERACTIVE=false
@@ -53,6 +67,10 @@ BOOTSTRAP=false
 DRY_RUN=false
 REFRESH_FACETS=true
 RECALL_QUERY=""
+RECALL_DEEP=false
+CLEAN_FACETS=false
+META_ANALYSIS=false
+OPTIMIZE_PROMPTS=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -70,6 +88,22 @@ while [[ $# -gt 0 ]]; do
             MEMORY_FILE="$MEMORY_DIR/MEMORY.md"
             shift 2
             ;;
+        --facet-model)
+            FACET_MODEL="$2"
+            if [[ "$FACET_MODEL" != "haiku" && "$FACET_MODEL" != "sonnet" ]]; then
+                echo "ERROR: --facet-model must be 'haiku' or 'sonnet'"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --clean-facets)    CLEAN_FACETS=true; shift ;;
+        --meta)            META_ANALYSIS=true; shift ;;
+        --deep-recall)
+            RECALL_QUERY="$2"
+            RECALL_DEEP=true
+            shift 2
+            ;;
+        --optimize-prompts) OPTIMIZE_PROMPTS=true; shift ;;
         -h|--help)
             echo "Usage: claude-self-improve [OPTIONS]"
             echo ""
@@ -81,23 +115,31 @@ while [[ $# -gt 0 ]]; do
             echo "  --dry-run          Run analysis but don't update any files"
             echo "  --refresh-facets   Force refresh facets from session transcripts (default: auto)"
             echo "  --no-refresh       Skip facet generation, use existing facets only"
-            echo "  --recall QUERY     Search past sessions by semantic similarity"
+            echo "  --recall QUERY     Search past sessions by semantic similarity (Haiku)"
+            echo "  --deep-recall Q    Deep semantic search with multi-hop reasoning (Sonnet)"
             echo "  --memory-dir DIR   Path to Claude Code memory directory"
             echo "                     (auto-detected if not set)"
+            echo "  --facet-model M    Override facet generation model (haiku or sonnet, default: sonnet)"
+            echo "  --clean-facets     Re-validate all existing facets (fix schema violations, no API calls)"
+            echo "  --meta             Force meta-analysis stage (normally runs every 5th run)"
+            echo "  --optimize-prompts Analyze prompt effectiveness and suggest improvements"
             echo ""
             echo "Environment Variables:"
             echo "  CLAUDE_MEMORY_DIR       Override memory directory path"
             echo "  CLAUDE_IMPROVE_DATA_DIR Override data directory (default: ~/.local/share/claude-improve)"
             echo ""
             echo "Stages (analysis mode):"
-            echo "  0. Refresh  — Auto-generates facets for sessions missing them (via Haiku)"
+            echo "  0. Refresh  — Auto-generates facets (Sonnet for complex, Haiku for simple)"
             echo "  1. Collect  — Gathers session facets from ~/.claude/usage-data/facets/"
             echo "  2. Analyze  — Sends to headless Claude (Sonnet) for pattern extraction"
             echo "  3. Update   — Applies memory updates via headless Claude (Sonnet)"
+            echo "  3.5 Route   — Distributes per-project insights to separate memory files"
+            echo "  4. Meta     — Periodic meta-analysis (every 5th run or --meta)"
             echo ""
-            echo "Recall mode (--recall):"
-            echo "  Searches session history using headless Claude (Haiku) for semantic matching."
+            echo "Recall mode (--recall / --deep-recall):"
+            echo "  Searches session history using headless Claude for semantic matching."
             echo "  Example: claude-self-improve --recall \"monetization strategy\""
+            echo "  Example: claude-self-improve --deep-recall \"what caused the sync issue last week\""
             echo ""
             exit 0
             ;;
@@ -143,6 +185,118 @@ if ! command -v jq &>/dev/null; then
 fi
 
 mkdir -p "$DATA_DIR" "$PROMPTS_DIR" "$BACKUPS_DIR"
+
+# ─── SQLite Setup ────────────────────────────────────────────────────────────
+# Ensure schema exists (idempotent — safe to run every time)
+if command -v sqlite3 &>/dev/null && [ -d "$(dirname "$SQLITE_DB")" ]; then
+    SQLITE_AVAILABLE=true
+    sqlite3 "$SQLITE_DB" << 'SQLEOF'
+CREATE TABLE IF NOT EXISTS facets (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    timestamp TEXT,
+    source TEXT DEFAULT 'self-improve',
+    facet_model TEXT,
+    underlying_goal TEXT,
+    outcome TEXT,
+    claude_helpfulness TEXT,
+    session_type TEXT,
+    primary_success TEXT,
+    session_complexity TEXT,
+    recovery_quality TEXT,
+    root_cause_depth TEXT,
+    context_switches INTEGER DEFAULT 0,
+    brief_summary TEXT,
+    friction_detail TEXT,
+    goal_categories TEXT,
+    friction_counts TEXT,
+    user_satisfaction_counts TEXT,
+    raw_json TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    sessions_analyzed INTEGER,
+    friction_rate REAL,
+    effective_friction_rate REAL,
+    complexity_weighted_friction_rate REAL,
+    avg_satisfaction REAL,
+    top_friction TEXT,
+    top_success TEXT,
+    outcome_success_rate REAL,
+    raw_json TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+SQLEOF
+    # Create FTS5 index if it doesn't exist (ignore error if already exists)
+    sqlite3 "$SQLITE_DB" "CREATE VIRTUAL TABLE IF NOT EXISTS facets_fts USING fts5(
+        session_id, underlying_goal, brief_summary, friction_detail, outcome, session_type,
+        content='facets', content_rowid='rowid'
+    );" 2>/dev/null
+    # Create sync triggers (ignore error if already exist)
+    sqlite3 "$SQLITE_DB" "CREATE TRIGGER IF NOT EXISTS facets_ai AFTER INSERT ON facets BEGIN
+        INSERT INTO facets_fts(rowid, session_id, underlying_goal, brief_summary, friction_detail, outcome, session_type)
+        VALUES (new.rowid, new.session_id, new.underlying_goal, new.brief_summary, new.friction_detail, new.outcome, new.session_type);
+    END;" 2>/dev/null
+    sqlite3 "$SQLITE_DB" "CREATE TRIGGER IF NOT EXISTS facets_ad AFTER DELETE ON facets BEGIN
+        INSERT INTO facets_fts(facets_fts, rowid, session_id, underlying_goal, brief_summary, friction_detail, outcome, session_type)
+        VALUES ('delete', old.rowid, old.session_id, old.underlying_goal, old.brief_summary, old.friction_detail, old.outcome, old.session_type);
+    END;" 2>/dev/null
+else
+    SQLITE_AVAILABLE=false
+fi
+
+# Helper: insert a facet JSON file into SQLite
+insert_facet_to_db() {
+    local facet_file="$1"
+    [ "$SQLITE_AVAILABLE" = true ] || return 0
+    [ -f "$facet_file" ] || return 0
+
+    python3 -c "
+import json, sys, sqlite3, os
+
+db_path = '$SQLITE_DB'
+facet_file = '$facet_file'
+
+with open(facet_file) as f:
+    data = json.load(f)
+
+conn = sqlite3.connect(db_path)
+conn.execute('''INSERT OR REPLACE INTO facets (
+    id, session_id, timestamp, source, facet_model,
+    underlying_goal, outcome, claude_helpfulness, session_type,
+    primary_success, session_complexity, recovery_quality,
+    root_cause_depth, context_switches,
+    brief_summary, friction_detail,
+    goal_categories, friction_counts, user_satisfaction_counts,
+    raw_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+    data.get('session_id', ''),
+    data.get('session_id', ''),
+    data.get('timestamp', ''),
+    data.get('source', 'self-improve'),
+    data.get('facet_model'),
+    data.get('underlying_goal', ''),
+    data.get('outcome', 'unclear_from_transcript'),
+    data.get('claude_helpfulness', 'helpful'),
+    data.get('session_type', 'exploration'),
+    data.get('primary_success', 'efficient_workflow'),
+    data.get('session_complexity', 'medium'),
+    data.get('recovery_quality', 'not_applicable'),
+    data.get('root_cause_depth', 'not_applicable'),
+    data.get('context_switches', 0),
+    data.get('brief_summary', ''),
+    data.get('friction_detail', ''),
+    json.dumps(data.get('goal_categories', {})),
+    json.dumps(data.get('friction_counts', {})),
+    json.dumps(data.get('user_satisfaction_counts', {})),
+    json.dumps(data),
+))
+conn.commit()
+conn.close()
+" 2>/dev/null
+}
 
 # Ensure prompts exist (copy from repo if installed via install.sh)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -286,7 +440,7 @@ PYEOF
     SESSION_COUNT=$(python3 -c "import json; print(len(json.load(open('$RECALL_INDEX'))))" 2>/dev/null || echo "0")
     log "  Indexed $SESSION_COUNT sessions from facets + history"
 
-    # Build recall input for Haiku
+    # Build recall input
     {
         echo "Find sessions matching this query: $RECALL_QUERY"
         echo ""
@@ -294,14 +448,23 @@ PYEOF
         cat "$RECALL_INDEX"
     } > "$RECALL_INPUT"
 
-    log "  Querying headless Claude (Haiku)..."
+    # Select model based on --recall vs --deep-recall
+    if [ "$RECALL_DEEP" = true ]; then
+        RECALL_MODEL="sonnet"
+        RECALL_BUDGET="0.50"
+        log "  Querying headless Claude (Sonnet — deep recall)..."
+    else
+        RECALL_MODEL="haiku"
+        RECALL_BUDGET="0.15"
+        log "  Querying headless Claude (Haiku)..."
+    fi
 
-    # Call headless Claude with Haiku
+    # Call headless Claude
     RECALL_OUTPUT="$DATA_DIR/recall-output.json"
     cat "$RECALL_INPUT" | claude -p - \
         --append-system-prompt "$(cat "$RECALL_PROMPT_FILE")" \
         --output-format json \
-        --model haiku \
+        --model "$RECALL_MODEL" \
         --tools "" \
         --max-budget-usd "$RECALL_BUDGET" \
         > "$RECALL_OUTPUT" 2>"$DATA_DIR/recall-stderr.log"
@@ -393,23 +556,215 @@ PYEOF
     exit 0
 fi
 
+# ─── Early-exit: Clean Facets ────────────────────────────────────────────────
+if [ "$CLEAN_FACETS" = true ]; then
+    log "═══════════════════════════════════════════════════"
+    log "  RETROACTIVE FACET CLEANUP"
+    log "═══════════════════════════════════════════════════"
+    VALIDATE_SCRIPT="$DATA_DIR/validate-facet.py"
+    if [ ! -f "$VALIDATE_SCRIPT" ]; then
+        log "ERROR: Validation script not found at $VALIDATE_SCRIPT"
+        exit 1
+    fi
+
+    CLEANED=0
+    TOTAL=0
+    COERCED=0
+    for f in "$FACETS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        TOTAL=$((TOTAL + 1))
+        RESULT=$(python3 "$VALIDATE_SCRIPT" "$f" --in-place 2>&1)
+        if [ $? -eq 0 ]; then
+            CLEANED=$((CLEANED + 1))
+            if echo "$RESULT" | grep -q "Coerced"; then
+                COERCED=$((COERCED + 1))
+            fi
+        else
+            log "  WARNING: Failed to validate $(basename "$f")"
+        fi
+    done
+
+    log "  Total facets: $TOTAL"
+    log "  Successfully validated: $CLEANED"
+    log "  Had schema violations fixed: $COERCED"
+    log ""
+    log "  All facets now comply with canonical schema."
+    log "  Run --bootstrap to reprocess with clean data."
+    exit 0
+fi
+
+# ─── Early-exit: Optimize Prompts ────────────────────────────────────────────
+if [ "$OPTIMIZE_PROMPTS" = true ]; then
+    log "═══════════════════════════════════════════════════"
+    log "  PROMPT OPTIMIZATION ANALYSIS"
+    log "═══════════════════════════════════════════════════"
+
+    OPTIMIZE_PROMPT_FILE="$PROMPTS_DIR/optimize-prompts.md"
+    if [ ! -f "$OPTIMIZE_PROMPT_FILE" ]; then
+        log "ERROR: Optimization prompt not found at $OPTIMIZE_PROMPT_FILE"
+        exit 1
+    fi
+
+    VALIDATE_SCRIPT="$DATA_DIR/validate-facet.py"
+    OPTIMIZE_INPUT="$DATA_DIR/optimize-input.txt"
+
+    # Gather current prompts
+    {
+        echo "=== CURRENT PROMPTS ==="
+        echo ""
+        for pf in "$PROMPTS_DIR"/*.md; do
+            [ -f "$pf" ] || continue
+            fname=$(basename "$pf")
+            [ "$fname" = "optimize-prompts.md" ] && continue
+            echo "--- $fname ---"
+            cat "$pf"
+            echo ""
+        done
+
+        echo "=== RECENT FACET SAMPLES (20) ==="
+        echo ""
+        ls -t "$FACETS_DIR"/*.json 2>/dev/null | head -20 | while read f; do
+            cat "$f"
+            echo ""
+        done
+
+        echo "=== SCHEMA VIOLATION STATS ==="
+        echo ""
+        # Quick audit of non-standard values in recent facets
+        python3 -c "
+import json, glob, os
+
+facets_dir = '$FACETS_DIR'
+files = sorted(glob.glob(os.path.join(facets_dir, '*.json')), key=os.path.getmtime, reverse=True)[:50]
+
+VALID = {
+    'friction_counts': {'wrong_approach','misunderstood_request','unnecessary_changes','wasted_time','forgot_workflow_step','tool_misuse','over_engineering','buggy_code'},
+    'session_type': {'quick_fix','iterative_refinement','exploration','debugging','documentation'},
+    'claude_helpfulness': {'very_helpful','helpful','somewhat_helpful','not_helpful'},
+    'primary_success': {'good_debugging','multi_file_changes','proactive_help','correct_code_edits','good_explanations','fast_accurate_search','efficient_workflow'},
+}
+
+violations = {}
+for f in files:
+    with open(f) as fh:
+        data = json.load(fh)
+    for fc_key in data.get('friction_counts', {}):
+        if fc_key not in VALID['friction_counts']:
+            violations.setdefault('friction_counts', {}).setdefault(fc_key, 0)
+            violations['friction_counts'][fc_key] += 1
+    for field in ['session_type', 'claude_helpfulness', 'primary_success']:
+        val = data.get(field, '')
+        if val and val not in VALID.get(field, set()):
+            violations.setdefault(field, {}).setdefault(val, 0)
+            violations[field][val] += 1
+
+print(json.dumps(violations, indent=2))
+" 2>/dev/null
+
+        # Include latest analysis if available
+        if [ -f "$DATA_DIR/analysis.json" ]; then
+            echo ""
+            echo "=== LATEST ANALYSIS OUTPUT ==="
+            cat "$DATA_DIR/analysis.json"
+        fi
+    } > "$OPTIMIZE_INPUT"
+
+    log "  Querying headless Claude (Sonnet)..."
+    OPTIMIZE_OUTPUT="$DATA_DIR/optimize-output.json"
+    cat "$OPTIMIZE_INPUT" | claude -p - \
+        --append-system-prompt "$(cat "$OPTIMIZE_PROMPT_FILE")" \
+        --allowedTools "Read" "Glob" "Grep" \
+        --output-format json \
+        --model sonnet \
+        --max-budget-usd "0.50" \
+        > "$OPTIMIZE_OUTPUT" 2>"$DATA_DIR/optimize-stderr.log"
+
+    OPT_EXIT=$?
+    if [ $OPT_EXIT -ne 0 ]; then
+        log "ERROR: Prompt optimization failed (exit code $OPT_EXIT)"
+        exit 1
+    fi
+
+    # Extract and display results
+    OPT_RESULT=$(jq -r '.result // .' "$OPTIMIZE_OUTPUT" 2>/dev/null)
+    CLEAN_OPT=$(echo "$OPT_RESULT" | python3 -c "
+import sys, json, re
+text = sys.stdin.read().strip()
+text = re.sub(r'^' + '```json\s*', '', text)
+text = re.sub(r'\s*' + '```$', '', text)
+try:
+    data = json.loads(text)
+    print(json.dumps(data, indent=2))
+except:
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        data = json.loads(match.group())
+        print(json.dumps(data, indent=2))
+    else:
+        sys.exit(1)
+" 2>/dev/null)
+
+    if [ -n "$CLEAN_OPT" ]; then
+        echo "$CLEAN_OPT" > "$OPTIMIZE_OUTPUT"
+
+        # Display prompt assessments
+        log ""
+        log "  Prompt Health Scores:"
+        log "  ─────────────────────────────"
+        echo "$CLEAN_OPT" | jq -r '.overall_health | to_entries[] | "  \(.key): \(.value)/100"' 2>/dev/null | while IFS= read -r line; do
+            log "$line"
+        done
+
+        # Display priority fixes
+        FIX_COUNT=$(echo "$CLEAN_OPT" | jq -r '.priority_fixes | length // 0' 2>/dev/null)
+        if [ "$FIX_COUNT" -gt 0 ] 2>/dev/null; then
+            log ""
+            log "  Priority Fixes:"
+            log "  ─────────────────────────────"
+            echo "$CLEAN_OPT" | jq -r '.priority_fixes[]? | "  [\(.impact)/\(.effort)] \(.prompt): \(.fix)"' 2>/dev/null | while IFS= read -r line; do
+                log "$line"
+            done
+        fi
+
+        # Display cross-prompt issues
+        CROSS_COUNT=$(echo "$CLEAN_OPT" | jq -r '.cross_prompt_issues | length // 0' 2>/dev/null)
+        if [ "$CROSS_COUNT" -gt 0 ] 2>/dev/null; then
+            log ""
+            log "  Cross-Prompt Issues:"
+            echo "$CLEAN_OPT" | jq -r '.cross_prompt_issues[]?' 2>/dev/null | while IFS= read -r line; do
+                log "    • $line"
+            done
+        fi
+
+        log ""
+        log "  Full results saved to: $OPTIMIZE_OUTPUT"
+        log "  NOTE: Changes are NOT auto-applied. Review and apply manually."
+    else
+        log "ERROR: Could not parse optimization output"
+        log "  Raw output saved to: $OPTIMIZE_OUTPUT"
+    fi
+
+    exit 0
+fi
+
 log "═══════════════════════════════════════════════════"
 log "  CLAUDE SELF-IMPROVEMENT RUN"
 log "  Mode: $([ "$BOOTSTRAP" = true ] && echo "BOOTSTRAP" || echo "incremental")"
 log "  Interactive: $INTERACTIVE | Dry-run: $DRY_RUN"
+log "  Facet model: $FACET_MODEL (tiered routing)"
 log "  Memory: $MEMORY_FILE"
 log "═══════════════════════════════════════════════════"
 
 # ─── Stage 0: Generate Missing Facets ────────────────────────────────────────
 # Facets are the raw performance data for each session. They may be generated by
-# /insights (in-session command) or by this stage (via headless Haiku).
+# /insights (in-session command) or by this stage (tiered: Sonnet for complex, Haiku for trivial).
 # This makes self-improve fully self-contained — no /insights dependency.
 if [ "$REFRESH_FACETS" = true ]; then
     log "Stage 0: Checking for sessions without facets..."
 
     FACETS_NEED_GENERATION=false
     FACET_PROMPT="$PROMPTS_DIR/generate-facet.md"
-    FACET_BUDGET="0.05"
+    VALIDATE_SCRIPT="$DATA_DIR/validate-facet.py"
     FACET_MAX_SESSIONS=50
     FACET_MIN_SIZE=5120        # 5KB minimum transcript size
     FACET_MAX_AGE_DAYS=7
@@ -470,7 +825,7 @@ for path, sid in candidates[:${FACET_MAX_SESSIONS}]:
         MISSING_COUNT=$(echo "$SESSIONS_TO_PROCESS" | grep -c . 2>/dev/null || echo 0)
 
         if [ "$MISSING_COUNT" -gt 0 ]; then
-            log "  Found $MISSING_COUNT sessions without facets. Generating via Haiku..."
+            log "  Found $MISSING_COUNT sessions without facets. Generating (default: $FACET_MODEL)..."
             mkdir -p "$FACETS_DIR"
 
             # Verify prompt file exists
@@ -516,29 +871,36 @@ $TRANSCRIPT
 
 Return ONLY the JSON facet object. No markdown fences, no commentary."
 
-                    # Generate facet via headless Claude Haiku
+                    # Tiered model routing: Sonnet for complex, Haiku for trivial
+                    TRANSCRIPT_SIZE=${#TRANSCRIPT}
+                    if [ "$FACET_MODEL" = "haiku" ]; then
+                        CHOSEN_MODEL="haiku"
+                        CHOSEN_BUDGET="$FACET_BUDGET_HAIKU"
+                    elif [ "$TRANSCRIPT_SIZE" -lt "$FACET_SIZE_THRESHOLD_LOW" ]; then
+                        CHOSEN_MODEL="haiku"
+                        CHOSEN_BUDGET="$FACET_BUDGET_HAIKU"
+                    else
+                        CHOSEN_MODEL="sonnet"
+                        CHOSEN_BUDGET="$FACET_BUDGET_SONNET"
+                    fi
+
+                    # Generate facet via headless Claude
                     FACET_RAW=$(echo "$WRAPPED_INPUT" | claude -p \
-                        --model haiku \
+                        --model "$CHOSEN_MODEL" \
                         --system-prompt "$(cat "$FACET_PROMPT")" \
-                        --max-budget-usd "$FACET_BUDGET" \
+                        --max-budget-usd "$CHOSEN_BUDGET" \
                         --no-session-persistence \
                         --tools "" \
                         2>/dev/null)
 
-                    # Strip markdown code fences if present, validate JSON, add metadata
-                    if echo "$FACET_RAW" | python3 -c "
-import sys, json, re
-raw = sys.stdin.read().strip()
-# Strip markdown code fences (e.g. \`\`\`json ... \`\`\`)
-raw = re.sub(r'^\`\`\`(?:json)?\s*\n?', '', raw)
-raw = re.sub(r'\n?\`\`\`\s*$', '', raw)
-data = json.loads(raw)
-data['session_id'] = '$SID'
-data['source'] = 'self-improve'
-with open('$FACETS_DIR/$SID.json', 'w') as f:
-    json.dump(data, f, indent=2)
-" 2>/dev/null; then
+                    # Validate JSON, enforce schema, add metadata
+                    if echo "$FACET_RAW" | python3 "$VALIDATE_SCRIPT" \
+                        --session-id "$SID" \
+                        --facet-model "$CHOSEN_MODEL" \
+                        --quiet \
+                        > "$FACETS_DIR/$SID.json" 2>/dev/null; then
                         GENERATED_COUNT=$((GENERATED_COUNT + 1))
+                        insert_facet_to_db "$FACETS_DIR/$SID.json"
                     else
                         log "    WARNING: Failed to generate valid facet for ${SID:0:12}"
                     fi
@@ -869,6 +1231,35 @@ METRICS_ENTRY=$(echo "$CLEAN_ANALYSIS" | jq -c '.metrics // {}' 2>/dev/null)
 if [ "$METRICS_ENTRY" != "{}" ] && [ -n "$METRICS_ENTRY" ]; then
     echo "$METRICS_ENTRY" >> "$METRICS_FILE"
     log "  Metrics appended to: $METRICS_FILE"
+
+    # Also write to SQLite
+    if [ "$SQLITE_AVAILABLE" = true ]; then
+        echo "$METRICS_ENTRY" | python3 -c "
+import json, sys, sqlite3
+data = json.load(sys.stdin)
+conn = sqlite3.connect('$SQLITE_DB')
+conn.execute('''INSERT INTO metrics (
+    timestamp, sessions_analyzed, friction_rate,
+    effective_friction_rate, complexity_weighted_friction_rate,
+    avg_satisfaction, top_friction, top_success,
+    outcome_success_rate, raw_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+    data.get('timestamp', ''),
+    data.get('sessions_analyzed', 0),
+    data.get('friction_rate', 0),
+    data.get('effective_friction_rate', 0),
+    data.get('complexity_weighted_friction_rate', 0),
+    data.get('avg_satisfaction', 0),
+    data.get('top_friction', ''),
+    data.get('top_success', ''),
+    data.get('outcome_success_rate', 0),
+    json.dumps(data),
+))
+conn.commit()
+conn.close()
+" 2>/dev/null
+        log "  Metrics also written to SQLite"
+    fi
 fi
 
 log "Stage 2 complete."
@@ -1206,6 +1597,119 @@ for proj_path, proj_threads in project_threads.items():
     log ""
 fi
 
+# ─── Stage 4: Meta-Analysis (periodic) ───────────────────────────────────────
+META_PROMPT_FILE="$PROMPTS_DIR/meta-analysis.md"
+META_INTERVAL=5
+PREV_RUN_COUNT=0
+if [ -f "$LAST_RUN" ]; then
+    PREV_RUN_COUNT=$(jq -r '.run_count // 0' "$LAST_RUN" 2>/dev/null || echo "0")
+fi
+RUN_COUNT=$((PREV_RUN_COUNT + 1))
+
+SHOULD_META=false
+if [ "$META_ANALYSIS" = true ]; then
+    SHOULD_META=true
+elif [ "$((RUN_COUNT % META_INTERVAL))" -eq 0 ]; then
+    SHOULD_META=true
+fi
+
+if [ "$SHOULD_META" = true ] && [ -f "$META_PROMPT_FILE" ] && [ "$DRY_RUN" = false ]; then
+    log ""
+    log "─── Stage 4: Meta-Analysis (run #$RUN_COUNT) ───"
+
+    META_INPUT_FILE="$DATA_DIR/meta-input.txt"
+    {
+        echo "Perform meta-analysis of the self-improvement system."
+        echo ""
+        echo "=== METRICS HISTORY ==="
+        cat "$METRICS_FILE" 2>/dev/null || echo "[]"
+        echo ""
+        echo "=== CURRENT ANALYSIS ==="
+        cat "$ANALYSIS_FILE"
+        echo ""
+        echo "=== CURRENT MEMORY ==="
+        cat "$MEMORY_FILE"
+    } > "$META_INPUT_FILE"
+
+    META_OUTPUT="$DATA_DIR/meta-analysis.json"
+    log "  Querying headless Claude (Sonnet)..."
+    cat "$META_INPUT_FILE" | claude -p - \
+        --append-system-prompt "$(cat "$META_PROMPT_FILE")" \
+        --allowedTools "Read" "Glob" "Grep" \
+        --output-format json \
+        --model sonnet \
+        --max-budget-usd "$META_BUDGET" \
+        > "$META_OUTPUT" 2>"$DATA_DIR/meta-stderr.log"
+
+    META_EXIT=$?
+    if [ $META_EXIT -ne 0 ]; then
+        log "  WARNING: Meta-analysis had issues (exit code $META_EXIT)"
+    else
+        # Extract result from Claude's JSON wrapper
+        META_RESULT=$(jq -r '.result // .' "$META_OUTPUT" 2>/dev/null)
+        # Parse out JSON
+        CLEAN_META=$(echo "$META_RESULT" | python3 -c "
+import sys, json, re
+text = sys.stdin.read().strip()
+text = re.sub(r'^' + '```json\s*', '', text)
+text = re.sub(r'\s*' + '```$', '', text)
+try:
+    data = json.loads(text)
+    print(json.dumps(data, indent=2))
+except:
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        data = json.loads(match.group())
+        print(json.dumps(data, indent=2))
+    else:
+        sys.exit(1)
+" 2>/dev/null)
+
+        if [ -n "$CLEAN_META" ]; then
+            echo "$CLEAN_META" > "$META_OUTPUT"
+
+            HEALTH_SCORE=$(echo "$CLEAN_META" | jq -r '.system_health_score // "?"' 2>/dev/null)
+            ZOMBIE_COUNT=$(echo "$CLEAN_META" | jq -r '.zombie_patterns | length // 0' 2>/dev/null)
+            STALE_COUNT=$(echo "$CLEAN_META" | jq -r '.stale_entries | length // 0' 2>/dev/null)
+            REC_COUNT=$(echo "$CLEAN_META" | jq -r '.recommendations | length // 0' 2>/dev/null)
+
+            log ""
+            log "  Meta-Analysis Results:"
+            log "  ─────────────────────────────"
+            log "  System health score: $HEALTH_SCORE/100"
+            log "  Zombie patterns:     $ZOMBIE_COUNT"
+            log "  Stale entries:       $STALE_COUNT"
+            log "  Recommendations:     $REC_COUNT"
+
+            # Show recommendations
+            if [ "$REC_COUNT" -gt 0 ] 2>/dev/null; then
+                log ""
+                log "  Recommendations:"
+                echo "$CLEAN_META" | jq -r '.recommendations[]?' 2>/dev/null | while IFS= read -r rec; do
+                    log "    • $rec"
+                done
+            fi
+
+            # Show zombie patterns
+            if [ "$ZOMBIE_COUNT" -gt 0 ] 2>/dev/null; then
+                log ""
+                log "  Zombie Patterns (documented but still recurring):"
+                echo "$CLEAN_META" | jq -r '.zombie_patterns[]? | "    ⚠ \(.pattern) — \(.trend)"' 2>/dev/null | while IFS= read -r line; do
+                    log "$line"
+                done
+            fi
+        else
+            log "  WARNING: Could not parse meta-analysis output"
+        fi
+    fi
+
+    log ""
+    log "Stage 4 complete."
+elif [ "$SHOULD_META" = true ] && [ "$DRY_RUN" = true ]; then
+    log ""
+    log "Stage 4: Meta-analysis would run (dry-run, skipping)"
+fi
+
 # ─── Update State ────────────────────────────────────────────────────────────
 EFF_VERDICT_SAFE="${EFF_VERDICT:-insufficient_data}"
 cat > "$LAST_RUN" << EOF
@@ -1216,7 +1720,9 @@ cat > "$LAST_RUN" << EOF
     "friction_rate": "$FRICTION_RATE",
     "trend": "$TREND",
     "updates_applied": $UPDATE_COUNT,
-    "effectiveness_verdict": "$EFF_VERDICT_SAFE"
+    "effectiveness_verdict": "$EFF_VERDICT_SAFE",
+    "run_count": $RUN_COUNT,
+    "facet_model": "$FACET_MODEL"
 }
 EOF
 
