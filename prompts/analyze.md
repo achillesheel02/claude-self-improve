@@ -5,7 +5,7 @@ You are analyzing Claude Code session performance data to extract actionable sel
 ## Input
 
 You will receive a JSON payload with:
-- `facets`: Array of session facet objects (each has `friction_counts`, `friction_detail`, `outcome`, `user_satisfaction_counts`, `primary_success`, `brief_summary`, `underlying_goal`, `goal_categories`, `session_id`, `project_path`)
+- `facets`: Array of session facet objects (each has `friction_counts`, `friction_detail`, `outcome`, `user_satisfaction_counts`, `primary_success`, `brief_summary`, `underlying_goal`, `goal_categories`, `session_id`, and optionally `facet_model`, `session_complexity`, `recovery_quality`, `context_switches`, `root_cause_depth`)
 - `current_memory`: Current contents of MEMORY.md
 - `memory_line_count`: Current line count of MEMORY.md
 - `previous_metrics`: Last 12 metrics snapshots (may be empty on first run)
@@ -27,14 +27,13 @@ You will receive a JSON payload with:
 
 7. **Identify domain lessons**: Any technical lessons from session summaries that aren't already in MEMORY.md.
 
-8. **Extract active threads**: Group sessions by recurring project/initiative themes using `underlying_goal` and `brief_summary`. An active thread is a topic that appears in 2+ sessions and represents ongoing work (not a one-off task). Examples: "marketing claude-self-improve", "Power BI RLS rollout", "dbt pipeline reliability". Capture the thread name, session count, last activity date, and current status (active/completed/stalled). **For each thread, collect the unique `project_path` values from its constituent sessions and include them in the output as `projects`.** This enables routing thread summaries to the correct project's MEMORY.md.
+8. **Extract active threads**: Group sessions by recurring project/initiative themes using `underlying_goal` and `brief_summary`. An active thread is a topic that appears in 2+ sessions and represents ongoing work (not a one-off task). Examples: "marketing claude-self-improve", "API migration", "CI/CD pipeline reliability". Capture the thread name, session count, last activity date, and current status (active/completed/stalled).
 
-9. **Effectiveness analysis**: Compare this run's per-friction-type rates against `previous_metrics` to determine whether memory updates are actually reducing friction.
-   - If `previous_metrics` has 2+ entries, compute the average friction rate and per-type counts from the oldest half ("baseline") and compare against the newest half + current run ("recent").
-   - For each friction type, compute delta (recent - baseline). Negative = improving.
-   - Correlate improvements with specific `memory_updates` or `claude_md_suggestions` from previous runs (listed in `current_memory`) — e.g., if "investigation-first rule" was added and `wrong_approach` dropped, flag as `likely_effective`.
-   - If `previous_metrics` has <2 entries (bootstrap or early runs), set `has_baseline: false` and skip comparison. This run becomes the baseline for future comparisons.
-   - Overall verdict: `improving` (aggregate friction rate dropped >5%), `stable` (within +/-5%), `regressing` (rose >5%), or `insufficient_data`.
+9. **Recovery pattern analysis**: From `recovery_quality` field, calculate the recovery rate. High friction + excellent recovery = acceptable performance (Claude self-corrected). High friction + poor recovery = urgent memory update needed (Claude persisted on wrong path). Report both raw friction rate and "effective friction rate" (friction events where recovery was partial or poor).
+
+10. **Complexity-weighted metrics**: From `session_complexity` field, weight friction rates by complexity. A `wrong_approach` in a high-complexity session is less concerning than one in a low-complexity session. Report both raw and complexity-weighted friction rates.
+
+11. **Facet quality comparison**: If facets have a `facet_model` field, compare Sonnet-generated vs Haiku-generated facets. Are Sonnet facets more specific in `friction_detail`? Calculate average `friction_detail` character length per model. Report in `facet_quality` section.
 
 ## Output Format
 
@@ -46,6 +45,8 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
   "friction_summary": {
     "total_friction_events": 25,
     "friction_rate": 0.41,
+    "effective_friction_rate": 0.25,
+    "complexity_weighted_friction_rate": 0.35,
     "top_types": [
       {"type": "wrong_approach", "count": 12, "pct": 0.48, "trend": "stable"},
       {"type": "unnecessary_changes", "count": 5, "pct": 0.20, "trend": "improving"}
@@ -62,6 +63,24 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
     "mostly_achieved": 12,
     "partially_achieved": 3,
     "not_achieved": 1
+  },
+  "recovery_summary": {
+    "excellent": 3,
+    "good": 5,
+    "partial": 2,
+    "poor": 1,
+    "not_applicable": 4
+  },
+  "complexity_distribution": {
+    "low": 3,
+    "medium": 5,
+    "high": 2
+  },
+  "facet_quality": {
+    "sonnet_count": 8,
+    "haiku_count": 2,
+    "avg_detail_length_sonnet": 120,
+    "avg_detail_length_haiku": 45
   },
   "memory_updates": [
     {
@@ -90,52 +109,19 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
       "sessions": 3,
       "last_seen": "2026-02-11",
       "status": "active",
-      "summary": "Discussed launch strategy, README improvements, cron automation docs",
-      "projects": ["/Users/bachillah/Documents/claude-self-improve"]
+      "summary": "Discussed launch strategy, README improvements, cron automation docs"
     }
   ],
-  "effectiveness": {
-    "has_baseline": true,
-    "baseline_runs": 3,
-    "baseline_friction_rate": 0.42,
-    "current_friction_rate": 0.35,
-    "friction_rate_delta": -0.07,
-    "satisfaction_delta": 0.3,
-    "outcome_delta": 0.05,
-    "per_type_changes": [
-      {"type": "wrong_approach", "baseline_count": 12, "current_count": 7, "delta": -5, "verdict": "improving"},
-      {"type": "misunderstood_request", "baseline_count": 8, "current_count": 9, "delta": 1, "verdict": "stable"}
-    ],
-    "likely_effective_updates": [
-      "Investigation-first rule (CLAUDE.md) → wrong_approach -5 sessions"
-    ],
-    "overall_verdict": "improving"
-  },
   "metrics": {
     "timestamp": "2026-02-10T20:00:00Z",
     "sessions_analyzed": 10,
     "friction_rate": 0.41,
+    "effective_friction_rate": 0.25,
+    "complexity_weighted_friction_rate": 0.35,
     "avg_satisfaction": 3.2,
     "top_friction": "wrong_approach",
     "top_success": "good_debugging",
-    "outcome_success_rate": 0.80,
-    "friction_by_type": {
-      "wrong_approach": 12,
-      "misunderstood_request": 8,
-      "unnecessary_changes": 3,
-      "buggy_code": 2
-    },
-    "outcome_counts": {
-      "fully_achieved": 8,
-      "mostly_achieved": 12,
-      "partially_achieved": 3,
-      "not_achieved": 1
-    },
-    "sessions_by_project": {
-      "/Users/bachillah/Documents/living_goods/Ona": 25,
-      "/Users/bachillah/Documents/ksl/ishara": 10,
-      "unknown": 5
-    }
+    "outcome_success_rate": 0.80
   },
   "trend": "stable"
 }
@@ -163,6 +149,7 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
    - `forgot_workflow_step` — Missed a step in established workflow
    - `tool_misuse` — Used wrong tool or wrong tool flags
    - `over_engineering` — Added unnecessary complexity
+   - `buggy_code` — Code had errors/bugs
 
 8. **Success types to track**:
    - `good_debugging` — Effective root cause analysis
@@ -170,4 +157,8 @@ Return ONLY valid JSON (no markdown code fences, no commentary):
    - `proactive_documentation` — Created docs/tickets without being asked
    - `efficient_workflow` — Completed task with minimal friction
 
-9. **Active thread detection**: Group `underlying_goal` and `brief_summary` across sessions to identify recurring project themes. A thread needs 2+ sessions to qualify. Mark threads as: `active` (seen in last 5 sessions), `stalled` (not seen in last 10 sessions), or `completed` (explicit completion signals in summary). Compare against existing `## Active Threads` section in MEMORY.md — update existing threads, add new ones, mark completed ones. **Include `projects` array** (unique `project_path` values from constituent sessions) so threads can be routed to per-project MEMORY.md files. Also tally `sessions_by_project` in `metrics` for visibility.
+9. **Active thread detection**: Group `underlying_goal` and `brief_summary` across sessions to identify recurring project themes. A thread needs 2+ sessions to qualify. Mark threads as: `active` (seen in last 5 sessions), `stalled` (not seen in last 10 sessions), or `completed` (explicit completion signals in summary). Compare against existing `## Active Threads` section in MEMORY.md — update existing threads, add new ones, mark completed ones.
+
+10. **Recovery quality weighting**: Sessions with `recovery_quality` of `excellent` should be downweighted in friction analysis — Claude self-corrected, so the net impact was low. Sessions with `poor` recovery should be highlighted as priority areas for memory updates.
+
+11. **Complexity context**: A `wrong_approach` in a `high` complexity session (3+ context switches, cross-system debugging) is expected and less actionable than the same friction in a `low` complexity session (simple single task). Factor this into `claude_md_suggestions` — only suggest behavioral changes for friction patterns that occur in low/medium complexity sessions.

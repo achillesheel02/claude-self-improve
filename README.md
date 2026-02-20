@@ -10,8 +10,9 @@ Claude Code stores session performance data as "facets" — JSON files capturing
 
 0. **Generates** missing facets from session transcripts (via Haiku — auto-detects stale data)
 1. **Collects** new session facets since the last run
-2. **Analyzes** them with headless Claude (Sonnet) to extract patterns
+2. **Analyzes** them with headless Claude (Sonnet) to extract patterns, track effectiveness, and detect trends
 3. **Updates** your MEMORY.md with new lessons, anti-patterns, and preferences
+4. **Meta-analyzes** itself periodically — detecting zombie patterns, stale entries, and scoring system health
 
 ```
 ┌─────────────────────────┐
@@ -57,6 +58,15 @@ Claude Code stores session performance data as "facets" — JSON files capturing
             │
             ▼
 ┌─────────────────────────┐
+│  Stage 4: Meta          │
+│  (every 5th run)        │
+│  Zombie detection,      │
+│  effectiveness scoring, │
+│  stale entry cleanup    │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
 │  Claude Code loads      │
 │  updated MEMORY.md      │
 │  in next session        │
@@ -73,6 +83,10 @@ Claude Code stores session performance data as "facets" — JSON files capturing
 | **Working preferences** | How you like to work (diagnostic queries first, one CSS change at a time) |
 | **Domain lessons** | Technical insights specific to your stack |
 | **Trend analysis** | Is friction improving, worsening, or stable over time? |
+| **Effectiveness tracking** | Are memory updates actually reducing friction? Correlates updates with outcomes |
+| **Recovery quality** | How well does Claude self-correct after friction? Distinguishes raw vs effective friction |
+| **Session complexity** | Weights friction by task difficulty — wrong approach on a hard task is less concerning |
+| **Zombie detection** | Finds anti-patterns documented in memory that still recur (meta-analysis) |
 
 ## Installation
 
@@ -148,6 +162,46 @@ Force facet generation even if facets are fresh:
 
 ```bash
 claude-self-improve --refresh-facets
+```
+
+### Deep Recall
+
+Search past sessions with multi-hop reasoning (uses Sonnet for causal chains and temporal reasoning):
+
+```bash
+claude-self-improve --deep-recall "what caused the deployment failure last week"
+```
+
+Standard recall uses Haiku (faster, cheaper). Deep recall uses Sonnet and returns up to 10 matches with connection chain reasoning.
+
+### Meta-Analysis
+
+Evaluate whether the system itself is working — are memory updates actually reducing friction?
+
+```bash
+claude-self-improve --meta
+```
+
+This runs automatically every 5th incremental run. It detects:
+- **Zombie patterns**: Anti-patterns documented in memory that still recur
+- **Stale entries**: Memory entries ready for archival (closed tickets, deprecated systems)
+- **Effectiveness correlation**: Which memory updates actually reduced their targeted friction type
+- **System health score**: 0-100 composite (friction trend, memory freshness, zombie count, update effectiveness)
+
+### Prompt Optimization
+
+Audit the quality of the system's own prompts against actual outputs:
+
+```bash
+claude-self-improve --optimize-prompts
+```
+
+### Clean Facets
+
+Re-validate all existing facets against the schema (no API calls, fixes schema violations locally):
+
+```bash
+claude-self-improve --clean-facets
 ```
 
 ### Slash Commands
@@ -251,9 +305,10 @@ The system uses headless Claude (Sonnet) for analysis. Typical costs:
 |-------|-------|-----------|--------------|
 | Refresh (per session) | Haiku | $0.05 | ~$0.01 |
 | Refresh (50 sessions) | Haiku | $2.50 | ~$0.50 |
-| Analyze | Sonnet | $0.50 | $0.05–0.15 |
+| Analyze | Sonnet | $1.00 | $0.05–0.15 |
 | Update | Sonnet | $0.30 | $0.02–0.05 |
-| **Total per run** | | **$3.30** | **$0.15–0.70** |
+| Meta-analysis (every 5th run) | Sonnet | $0.50 | $0.10–0.20 |
+| **Total per run** | | **$4.30** | **$0.15–0.90** |
 
 Running weekly costs roughly **$1–3/month**. Stage 0 only runs when facets are stale (>1h old) and only generates facets for sessions that don't have them, so most incremental runs process 0–5 sessions.
 
@@ -268,11 +323,15 @@ Stage 0 checks for staleness: if facets were recently generated (by `/insights` 
 
 Each facet includes:
 
-- `friction_counts` — Types and counts of friction events
+- `friction_counts` — Types and counts of friction events (8 canonical types)
 - `friction_detail` — Free-text description of what went wrong
 - `outcome` — Whether the task was fully/mostly/partially achieved
 - `user_satisfaction_counts` — Satisfaction signals
 - `primary_success` — What Claude did well
+- `session_complexity` — Low/medium/high task difficulty rating
+- `recovery_quality` — How well Claude self-corrected after friction
+- `context_switches` — Number of topic transitions in the session
+- `root_cause_depth` — Surface/moderate/deep for debugging sessions
 - `brief_summary` — One-line session summary
 
 The self-improvement system reads these facets to find patterns across sessions.
@@ -284,6 +343,9 @@ The analysis and update prompts are in `~/.local/share/claude-improve/prompts/`:
 - `generate-facet.md` — Controls how session transcripts are summarized into facets (Stage 0)
 - `analyze.md` — Controls what patterns to look for and output format (Stage 2)
 - `update-memory.md` — Controls how MEMORY.md is updated (Stage 3)
+- `meta-analysis.md` — Controls system self-evaluation (Stage 4)
+- `recall.md` — Controls session search behavior
+- `optimize-prompts.md` — Controls prompt quality auditing
 
 Edit these to change what the system tracks or how it writes memories.
 

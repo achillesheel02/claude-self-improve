@@ -27,7 +27,8 @@ if [ "$1" = "--uninstall" ]; then
     echo "Uninstalling claude-self-improve..."
     rm -f "$INSTALL_DIR/claude-self-improve"
     rm -f "$COMMANDS_DIR/self-improve.md"
-    info "Removed binary and slash command."
+    rm -f "$COMMANDS_DIR/recall.md"
+    info "Removed binary and slash commands."
     warn "Data directory preserved at: $DATA_DIR"
     warn "  Remove manually: rm -rf $DATA_DIR"
     exit 0
@@ -68,8 +69,14 @@ chmod +x "$INSTALL_DIR/claude-self-improve"
 info "Installing prompts to $PROMPTS_DIR/..."
 cp "$REPO_DIR/prompts/"*.md "$PROMPTS_DIR/"
 
-info "Installing slash command to $COMMANDS_DIR/self-improve.md..."
+info "Installing helper scripts to $DATA_DIR/..."
+for helper in "$REPO_DIR/bin/"*.py; do
+    [ -f "$helper" ] && cp "$helper" "$DATA_DIR/"
+done
+
+info "Installing slash commands to $COMMANDS_DIR/..."
 cp "$REPO_DIR/commands/self-improve.md" "$COMMANDS_DIR/self-improve.md"
+[ -f "$REPO_DIR/commands/recall.md" ] && cp "$REPO_DIR/commands/recall.md" "$COMMANDS_DIR/recall.md"
 
 # Check if ~/.local/bin is in PATH
 if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
